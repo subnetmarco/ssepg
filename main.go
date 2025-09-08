@@ -10,7 +10,7 @@ import (
 	_ "go.uber.org/automaxprocs"
 
 	"github.com/jackc/pgx/v5/pgxpool" // optional, just to validate DSN early
-	"github.com/yourorg/ssepg"        // <-- replace with your module path
+	"github.com/subnetmarcop/ssepg"
 )
 
 func main() {
