@@ -33,7 +33,7 @@ import (
   "time"
 
   _ "go.uber.org/automaxprocs"
-  "github.com/yourorg/ssepg" // replace with your module path
+  "github.com/subnetmarco/ssepg" // replace with your module path
 )
 
 func main() {
