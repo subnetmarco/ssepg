@@ -185,42 +185,69 @@ type postBody struct {
 
 func (s *Service) handleTopic() http.HandlerFunc {
 	base := strings.TrimRight(s.cfg.BasePath, "/") + "/"
+	const eventsPath = "events"
+	
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !strings.HasPrefix(r.URL.Path, base) {
-			http.NotFound(w, r)
-			return
-		}
-		rest := strings.TrimPrefix(r.URL.Path, base)
-		parts := strings.Split(rest, "/")
-		if len(parts) == 0 || parts[0] == "" {
-			http.NotFound(w, r)
-			return
-		}
-		topic, ok := normalizeTopic(parts[0])
+		topic, parts, ok := s.parseTopicRequest(w, r, base)
 		if !ok {
-			http.Error(w, "invalid topic (allowed [a-z0-9_-]{1,128})", http.StatusBadRequest)
+			return // Error already sent
+		}
+
+		// Route to appropriate handler
+		if len(parts) == 2 && parts[1] == eventsPath {
+			switch r.Method {
+			case http.MethodPost:
+				s.handlePublish(w, r, topic)
+			case http.MethodGet:
+				s.handleSubscribe(w, r, topic)
+			default:
+				http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			}
 			return
 		}
 
-		// Publish
-		if r.Method == http.MethodPost && len(parts) == 2 && parts[1] == "events" {
-			r.Body = http.MaxBytesReader(w, r.Body, 256<<10) // 256KB
-			var body postBody
-			if err := json.NewDecoder(r.Body).Decode(&body); err != nil || len(body.Data) == 0 || string(body.Data) == "null" {
-				http.Error(w, "invalid JSON; expected {\"data\": ...}", http.StatusBadRequest)
-				return
-			}
-			if err := s.br.Publish(r.Context(), topic, body.Data); err != nil {
-				http.Error(w, "publish error: "+err.Error(), http.StatusServiceUnavailable)
-				return
-			}
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]any{"topic": topic, "data": body.Data})
-			return
-		}
+		http.NotFound(w, r)
+	}
+}
 
-		// Subscribe SSE
-		if r.Method == http.MethodGet && len(parts) == 2 && parts[1] == "events" {
+// parseTopicRequest extracts and validates topic from request path
+func (s *Service) parseTopicRequest(w http.ResponseWriter, r *http.Request, base string) (string, []string, bool) {
+	if !strings.HasPrefix(r.URL.Path, base) {
+		http.NotFound(w, r)
+		return "", nil, false
+	}
+	rest := strings.TrimPrefix(r.URL.Path, base)
+	parts := strings.Split(rest, "/")
+	if len(parts) == 0 || parts[0] == "" {
+		http.NotFound(w, r)
+		return "", nil, false
+	}
+	topic, ok := normalizeTopic(parts[0])
+	if !ok {
+		http.Error(w, "invalid topic (allowed [a-z0-9_-]{1,128})", http.StatusBadRequest)
+		return "", nil, false
+	}
+	return topic, parts, true
+}
+
+// handlePublish processes POST requests to publish messages
+func (s *Service) handlePublish(w http.ResponseWriter, r *http.Request, topic string) {
+	r.Body = http.MaxBytesReader(w, r.Body, 256<<10) // 256KB
+	var body postBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || len(body.Data) == 0 || string(body.Data) == "null" {
+		http.Error(w, "invalid JSON; expected {\"data\": ...}", http.StatusBadRequest)
+		return
+	}
+	if err := s.br.Publish(r.Context(), topic, body.Data); err != nil {
+		http.Error(w, "publish error: "+err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"topic": topic, "data": body.Data})
+}
+
+// handleSubscribe processes GET requests for SSE subscriptions
+func (s *Service) handleSubscribe(w http.ResponseWriter, r *http.Request, topic string) {
 			w.Header().Set("Content-Type", "text/event-stream")
 			w.Header().Set("Cache-Control", "no-cache")
 			w.Header().Set("Connection", "keep-alive")
