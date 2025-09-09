@@ -25,8 +25,11 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
+	"os/exec"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -70,11 +73,193 @@ type Config struct {
 	// Diagnostics
 	QueueWarnThreshold float64       // default 0.5 (warn at 50% usage)
 	QueuePollInterval  time.Duration // default 30s
+	
+	// Memory management
+	MemoryCleanupInterval time.Duration // default 5m (cleanup unused topics)
+	TopicIdleTimeout      time.Duration // default 10m (remove idle topics)
+	MemoryPressureThreshold int64       // default 100MB (trigger cleanup)
+	
 	// Advanced (optional, requires superuser; 0 disables)
 	AlterSystemMaxNotificationMB int
 }
 
+// getSystemMemoryMB returns total system memory in megabytes
+func getSystemMemoryMB() int64 {
+	// Try Linux /proc/meminfo first
+	if runtime.GOOS == "linux" {
+		if data, err := os.ReadFile("/proc/meminfo"); err == nil {
+			lines := strings.Split(string(data), "\n")
+			for _, line := range lines {
+				if strings.HasPrefix(line, "MemTotal:") {
+					fields := strings.Fields(line)
+					if len(fields) >= 2 {
+						if kb, err := strconv.ParseInt(fields[1], 10, 64); err == nil {
+							return kb / 1024 // Convert KB to MB
+						}
+					}
+				}
+			}
+		}
+	}
+	
+	// Try macOS sysctl
+	if runtime.GOOS == "darwin" {
+		if cmd := exec.Command("sysctl", "-n", "hw.memsize"); cmd != nil {
+			if output, err := cmd.Output(); err == nil {
+				if bytes, err := strconv.ParseInt(strings.TrimSpace(string(output)), 10, 64); err == nil {
+					return bytes / (1024 * 1024) // Convert bytes to MB
+				}
+			}
+		}
+	}
+	
+	// Try Windows wmic
+	if runtime.GOOS == "windows" {
+		if cmd := exec.Command("wmic", "computersystem", "get", "TotalPhysicalMemory", "/value"); cmd != nil {
+			if output, err := cmd.Output(); err == nil {
+				lines := strings.Split(string(output), "\n")
+				for _, line := range lines {
+					if strings.HasPrefix(line, "TotalPhysicalMemory=") {
+						valueStr := strings.TrimPrefix(line, "TotalPhysicalMemory=")
+						valueStr = strings.TrimSpace(valueStr)
+						if bytes, err := strconv.ParseInt(valueStr, 10, 64); err == nil {
+							return bytes / (1024 * 1024) // Convert bytes to MB
+						}
+					}
+				}
+			}
+		}
+	}
+	
+	// Final fallback: estimate based on CPU cores (modern systems)
+	cpus := runtime.NumCPU()
+	var estimatedGB int64
+	
+	// More realistic estimates based on typical modern systems
+	if cpus >= 16 {
+		estimatedGB = int64(cpus) * 4 // 4GB per core for high-end systems
+	} else if cpus >= 8 {
+		estimatedGB = int64(cpus) * 3 // 3GB per core for mid-range
+	} else if cpus >= 4 {
+		estimatedGB = int64(cpus) * 2 // 2GB per core for entry-level
+	} else {
+		estimatedGB = 8 // Minimum reasonable assumption
+	}
+	
+	// Cap the estimate at reasonable bounds
+	if estimatedGB < 4 {
+		estimatedGB = 4 // Minimum 4GB
+	}
+	if estimatedGB > 256 {
+		estimatedGB = 256 // Maximum 256GB for safety
+	}
+	
+	return estimatedGB * 1024 // Convert GB to MB
+}
+
+// getOptimalShardCount calculates optimal shard count based on CPU cores
+func getOptimalShardCount(baseFactor int) int {
+	cpus := runtime.NumCPU()
+	// Use CPU count as base, with minimum and maximum bounds
+	shards := cpus * baseFactor
+	
+	// Ensure power of 2 for efficient hashing (for NotifyShards)
+	if baseFactor == 1 { // NotifyShards case
+		if shards < 8 {
+			return 8
+		}
+		if shards > 128 {
+			return 128
+		}
+		// Round to next power of 2
+		for i := 8; i <= 128; i *= 2 {
+			if i >= shards {
+				return i
+			}
+		}
+		return 64
+	}
+	
+	// For FanoutShards, use direct CPU multiple with bounds
+	if shards < 4 {
+		return 4
+	}
+	if shards > 64 {
+		return 64
+	}
+	return shards
+}
+
+// calculateOptimalConfig creates configuration based on system resources
+func calculateOptimalConfig() Config {
+	memoryMB := getSystemMemoryMB()
+	cpus := runtime.NumCPU()
+	
+	// Base configuration
+	cfg := Config{
+		BasePath:  "/topics",
+		Healthz:   "/healthz",
+		KeepAlive: 15 * time.Second,
+		SSEBufSize: 32 << 10,
+		MaxNotifyBytes: 7900,
+		GracefulDrain: 10 * time.Second,
+		QueueWarnThreshold: 0.5,
+		QueuePollInterval: 30 * time.Second,
+		MemoryCleanupInterval: 5 * time.Minute,
+		TopicIdleTimeout: 10 * time.Minute,
+	}
+	
+	// Scale based on available memory
+	if memoryMB < 1024 { // < 1GB - minimal config
+		cfg.NotifyShards = 4
+		cfg.FanoutShards = 2
+		cfg.RingCapacity = 512
+		cfg.ClientChanBuf = 32
+		cfg.MemoryPressureThreshold = 50 * 1024 * 1024 // 50MB
+		cfg.AlterSystemMaxNotificationMB = 16
+	} else if memoryMB < 4096 { // 1-4GB - small scale
+		cfg.NotifyShards = 8
+		cfg.FanoutShards = 4
+		cfg.RingCapacity = 1024
+		cfg.ClientChanBuf = 64
+		cfg.MemoryPressureThreshold = 200 * 1024 * 1024 // 200MB
+		cfg.AlterSystemMaxNotificationMB = 64
+	} else if memoryMB < 16384 { // 4-16GB - medium scale
+		cfg.NotifyShards = getOptimalShardCount(1)  // CPU-based
+		cfg.FanoutShards = getOptimalShardCount(2) // 2x CPU
+		cfg.RingCapacity = 2048
+		cfg.ClientChanBuf = 128
+		cfg.MemoryPressureThreshold = int64(memoryMB) * 1024 * 1024 / 4 // 25% of RAM
+		cfg.AlterSystemMaxNotificationMB = 256
+	} else { // 16GB+ - high scale
+		cfg.NotifyShards = getOptimalShardCount(1)  // CPU-based
+		cfg.FanoutShards = getOptimalShardCount(4) // 4x CPU for high fanout
+		cfg.RingCapacity = 8192
+		cfg.ClientChanBuf = 512
+		cfg.MemoryPressureThreshold = int64(memoryMB) * 1024 * 1024 / 3 // 33% of RAM
+		cfg.AlterSystemMaxNotificationMB = 1024
+		
+		// High-scale optimizations
+		cfg.KeepAlive = 30 * time.Second // Reduce heartbeat overhead
+		cfg.SSEBufSize = 64 << 10        // Larger SSE buffers
+		cfg.QueuePollInterval = 10 * time.Second // More frequent monitoring
+		cfg.MemoryCleanupInterval = 2 * time.Minute // More frequent cleanup
+	}
+	
+	log.Printf("ssepg: auto-configured for %d CPU cores, %d MB RAM", cpus, memoryMB)
+	log.Printf("ssepg: NotifyShards=%d, FanoutShards=%d, RingCapacity=%d, ClientChanBuf=%d", 
+		cfg.NotifyShards, cfg.FanoutShards, cfg.RingCapacity, cfg.ClientChanBuf)
+	
+	return cfg
+}
+
+// DefaultConfig returns an adaptive configuration that automatically scales based on system resources
 func DefaultConfig() Config {
+	return calculateOptimalConfig()
+}
+
+// StaticConfig returns the original static configuration for backward compatibility
+func StaticConfig() Config {
 	return Config{
 		BasePath:                     "/topics",
 		Healthz:                      "/healthz",
@@ -88,7 +273,32 @@ func DefaultConfig() Config {
 		GracefulDrain:                10 * time.Second,
 		QueueWarnThreshold:           0.5,
 		QueuePollInterval:            30 * time.Second,
+		MemoryCleanupInterval:        5 * time.Minute,
+		TopicIdleTimeout:             10 * time.Minute,
+		MemoryPressureThreshold:      100 * 1024 * 1024, // 100MB
 		AlterSystemMaxNotificationMB: 0,
+	}
+}
+
+// HighScaleConfig returns a configuration optimized for hundreds of thousands of concurrent clients
+func HighScaleConfig() Config {
+	return Config{
+		BasePath:                     "/topics",
+		Healthz:                      "/healthz",
+		KeepAlive:                    30 * time.Second, // Longer to reduce overhead
+		SSEBufSize:                   64 << 10,         // 64KB buffer
+		NotifyShards:                 64,               // More shards for distribution
+		FanoutShards:                 32,               // More workers per topic
+		RingCapacity:                 8192,             // Larger ring buffer
+		ClientChanBuf:                512,              // Larger client buffers
+		MaxNotifyBytes:               7900,
+		GracefulDrain:                30 * time.Second, // Longer drain for many clients
+		QueueWarnThreshold:           0.3,              // Earlier warning
+		QueuePollInterval:            10 * time.Second, // More frequent monitoring
+		MemoryCleanupInterval:        2 * time.Minute, // More frequent cleanup
+		TopicIdleTimeout:             5 * time.Minute, // Faster cleanup
+		MemoryPressureThreshold:      10 * 1024 * 1024 * 1024, // 10GB
+		AlterSystemMaxNotificationMB: 1024,                     // 1GB notification queue
 	}
 }
 
@@ -142,6 +352,15 @@ func New(ctx context.Context, cfg Config) (*Service, error) {
 	}
 	if cfg.QueuePollInterval <= 0 {
 		cfg.QueuePollInterval = 30 * time.Second
+	}
+	if cfg.MemoryCleanupInterval <= 0 {
+		cfg.MemoryCleanupInterval = 5 * time.Minute
+	}
+	if cfg.TopicIdleTimeout <= 0 {
+		cfg.TopicIdleTimeout = 10 * time.Minute
+	}
+	if cfg.MemoryPressureThreshold <= 0 {
+		cfg.MemoryPressureThreshold = 100 * 1024 * 1024 // 100MB
 	}
 
 	br, err := newBroker(ctx, cfg)
@@ -461,6 +680,9 @@ func (s *Service) handleHealthz() http.HandlerFunc {
 			Broadcast        int64  `json:"broadcast"`
 			DeliveredFrames  int64  `json:"delivered_frames"`
 			DroppedClients   int64  `json:"dropped_clients"`
+			MemoryUsage      int64  `json:"memory_usage_bytes"`
+			LastActivity     int64  `json:"last_activity_unix"`
+			IsIdle           bool   `json:"is_idle"`
 		}
 		type totalsResp struct {
 			Topics           int   `json:"topics"`
@@ -471,6 +693,8 @@ func (s *Service) handleHealthz() http.HandlerFunc {
 			Broadcast        int64 `json:"broadcast"`
 			DeliveredFrames  int64 `json:"delivered_frames"`
 			DroppedClients   int64 `json:"dropped_clients"`
+			TotalMemoryUsage int64 `json:"total_memory_usage_bytes"`
+			IdleTopics       int   `json:"idle_topics"`
 		}
 
 		// Collect from all topic shards
@@ -494,6 +718,10 @@ func (s *Service) handleHealthz() http.HandlerFunc {
 				depth := h.size
 				h.ringMu.Unlock()
 
+				memUsage := h.memoryUsage.Load()
+				lastActivity := h.lastActivity.Load()
+				isIdle := h.isMarkedIdle.Load()
+				
 				topicList = append(topicList, topicSnapshot{
 					Topic:            name,
 					Subscribers:      subs,
@@ -503,7 +731,15 @@ func (s *Service) handleHealthz() http.HandlerFunc {
 					Broadcast:        h.broadcast.Load(),
 					DeliveredFrames:  h.deliveredFrames.Load(),
 					DroppedClients:   h.droppedClients.Load(),
+					MemoryUsage:      memUsage,
+					LastActivity:     lastActivity,
+					IsIdle:           isIdle,
 				})
+				
+				tot.TotalMemoryUsage += memUsage
+				if isIdle {
+					tot.IdleTopics++
+				}
 				tot.Topics++
 				tot.Subscribers += subs
 				tot.DispatchDepth += depth
@@ -584,14 +820,26 @@ type topicHub struct {
 	broadcast       atomic.Int64
 	deliveredFrames atomic.Int64
 	droppedClients  atomic.Int64
+	
+	// memory management
+	lastActivity  atomic.Int64 // Unix timestamp of last activity
+	memoryUsage   atomic.Int64 // Estimated memory usage in bytes
+	isMarkedIdle  atomic.Bool  // Whether this hub is marked for cleanup
 }
 
 // enqueue payload; drop oldest if full; aggressive buffer reuse
 func (h *topicHub) enqueue(p []byte) {
+	// Update activity timestamp for cleanup detection
+	h.lastActivity.Store(time.Now().Unix())
+	h.isMarkedIdle.Store(false) // Reset idle marker
+	
 	h.ringMu.Lock()
+	var memoryDelta int64
+	
 	if h.size == h.cap { // drop-oldest
 		// Return dropped buffer to pool before overwriting
 		if dropped := h.ring[h.tail]; dropped != nil {
+			memoryDelta -= int64(cap(dropped))
 			byteSliceBuf.Put(dropped)
 		}
 		h.tail = (h.tail + 1) & h.mask
@@ -607,12 +855,14 @@ func (h *topicHub) enqueue(p []byte) {
 	} else {
 		// Get buffer from pool or allocate new one
 		if slot != nil {
+			memoryDelta -= int64(cap(slot))
 			byteSliceBuf.Put(slot) // Return old buffer to pool
 		}
 		newSlot := byteSliceBuf.Get(len(p))
 		newSlot = newSlot[:len(p)]
 		copy(newSlot, p)
 		h.ring[h.head] = newSlot
+		memoryDelta += int64(cap(newSlot))
 	}
 
 	h.head = (h.head + 1) & h.mask
@@ -620,6 +870,9 @@ func (h *topicHub) enqueue(p []byte) {
 		h.size++
 	}
 	h.ringMu.Unlock()
+	
+	// Update memory usage estimate
+	h.memoryUsage.Add(memoryDelta)
 
 	// Non-blocking notification (coalesce wake-ups)
 	select {
@@ -717,6 +970,7 @@ func newBroker(ctx context.Context, cfg Config) (*broker, error) {
 	}
 	go b.notificationLoop(ctx)
 	go b.queueUsageMonitor(ctx)
+	go b.memoryCleanupMonitor(ctx)
 
 	if mb := cfg.AlterSystemMaxNotificationMB; mb > 0 {
 		_, err := nc.Exec(ctx, `ALTER SYSTEM SET max_notification_queue_size = '`+fmt.Sprint(mb)+`MB'`)
@@ -753,6 +1007,160 @@ func (b *broker) getTopicShard(topic string) *topicShard {
 	return &b.topicShards[h%topicShards]
 }
 
+// memoryCleanupMonitor periodically cleans up idle topics and manages memory pressure
+func (b *broker) memoryCleanupMonitor(ctx context.Context) {
+	ticker := time.NewTicker(b.cfg.MemoryCleanupInterval)
+	defer ticker.Stop()
+	
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			b.performMemoryCleanup()
+		}
+	}
+}
+
+// performMemoryCleanup identifies and cleans up idle topics and manages memory pressure
+func (b *broker) performMemoryCleanup() {
+	now := time.Now().Unix()
+	idleThreshold := now - int64(b.cfg.TopicIdleTimeout.Seconds())
+	
+	var totalMemoryUsage int64
+	var idleTopics []string
+	var memoryPressureTopics []*topicHub
+	
+	// Scan all topic shards for cleanup candidates
+	for i := range b.topicShards {
+		shard := &b.topicShards[i]
+		shard.mu.RLock()
+		
+		for topicName, hub := range shard.topics {
+			lastActivity := hub.lastActivity.Load()
+			memUsage := hub.memoryUsage.Load()
+			totalMemoryUsage += memUsage
+			
+			// Check if topic is idle
+			if lastActivity < idleThreshold && !hub.isMarkedIdle.Load() {
+				// Check if there are no active subscribers
+				hasSubscribers := false
+				for j := 0; j < len(hub.subs); j++ {
+					hub.subsMu[j].RLock()
+					if len(hub.subs[j]) > 0 {
+						hasSubscribers = true
+					}
+					hub.subsMu[j].RUnlock()
+					if hasSubscribers {
+						break
+					}
+				}
+				
+				if !hasSubscribers {
+					idleTopics = append(idleTopics, topicName)
+					hub.isMarkedIdle.Store(true)
+				}
+			}
+			
+			// Check for memory pressure
+			if memUsage > b.cfg.MemoryPressureThreshold/10 { // 10MB per topic threshold
+				memoryPressureTopics = append(memoryPressureTopics, hub)
+			}
+		}
+		
+		shard.mu.RUnlock()
+	}
+	
+	// Log memory status if significant usage
+	if totalMemoryUsage > b.cfg.MemoryPressureThreshold/2 {
+		log.Printf("ssepg: memory usage %d MB, %d idle topics, %d high-memory topics", 
+			totalMemoryUsage/(1024*1024), len(idleTopics), len(memoryPressureTopics))
+	}
+	
+	// Clean up idle topics
+	if len(idleTopics) > 0 {
+		b.cleanupIdleTopics(idleTopics)
+	}
+	
+	// Handle memory pressure by cleaning ring buffers
+	if totalMemoryUsage > b.cfg.MemoryPressureThreshold {
+		b.handleMemoryPressure(memoryPressureTopics)
+	}
+}
+
+// cleanupIdleTopics removes topics that have been idle for too long
+func (b *broker) cleanupIdleTopics(idleTopics []string) {
+	cleaned := 0
+	for _, topicName := range idleTopics {
+		shard := b.getTopicShard(topicName)
+		shard.mu.Lock()
+		
+		if hub, exists := shard.topics[topicName]; exists {
+			// Double-check it's still idle and has no subscribers
+			hasSubscribers := false
+			for j := 0; j < len(hub.subs); j++ {
+				hub.subsMu[j].RLock()
+				if len(hub.subs[j]) > 0 {
+					hasSubscribers = true
+				}
+				hub.subsMu[j].RUnlock()
+				if hasSubscribers {
+					break
+				}
+			}
+			
+			if !hasSubscribers && hub.isMarkedIdle.Load() {
+				// Clean up the hub
+				close(hub.quit)
+				
+				// Clean up ring buffer and return memory to pool
+				hub.ringMu.Lock()
+				for i := 0; i < hub.cap; i++ {
+					if hub.ring[i] != nil {
+						byteSliceBuf.Put(hub.ring[i])
+					}
+				}
+				hub.ringMu.Unlock()
+				
+				delete(shard.topics, topicName)
+				cleaned++
+			}
+		}
+		
+		shard.mu.Unlock()
+	}
+	
+	if cleaned > 0 {
+		log.Printf("ssepg: cleaned up %d idle topics", cleaned)
+	}
+}
+
+// handleMemoryPressure reduces memory usage when under pressure
+func (b *broker) handleMemoryPressure(pressureTopics []*topicHub) {
+	cleaned := 0
+	for _, hub := range pressureTopics {
+		hub.ringMu.Lock()
+		// Reduce ring buffer size by half to free memory
+		if hub.size > hub.cap/4 {
+			newTail := (hub.tail + hub.size/2) & hub.mask
+			for i := hub.tail; i != newTail; i = (i + 1) & hub.mask {
+				if hub.ring[i] != nil {
+					byteSliceBuf.Put(hub.ring[i])
+					hub.ring[i] = nil
+				}
+			}
+			hub.tail = newTail
+			hub.size = hub.size / 2
+			cleaned++
+		}
+		hub.ringMu.Unlock()
+	}
+	
+	if cleaned > 0 {
+		log.Printf("ssepg: reduced ring buffers for %d topics under memory pressure", cleaned)
+	}
+}
+
 func (b *broker) hub(topic string) *topicHub {
 	shard := b.getTopicShard(topic)
 
@@ -778,6 +1186,9 @@ func (b *broker) hub(topic string) *topicHub {
 		notify: make(chan struct{}, 1),
 		quit:   make(chan struct{}),
 	}
+	// Initialize memory tracking
+	h.lastActivity.Store(time.Now().Unix())
+	h.memoryUsage.Store(int64(b.cfg.RingCapacity * 8)) // Estimate for slice overhead
 	// init shards
 	h.subsMu = make([]sync.RWMutex, b.cfg.FanoutShards)
 	h.subs = make([]map[chan []byte]struct{}, b.cfg.FanoutShards)
@@ -849,24 +1260,34 @@ func (b *broker) deliverToShard(topic string, hub *topicHub, shard int, payload 
 	}
 	hub.subsMu[shard].RUnlock()
 
-	// Each subscriber gets their own copy to ensure complete isolation
-	for _, ch := range snapshot {
-		// Make a dedicated copy for this subscriber
-		subscriberPayload := make([]byte, len(payload))
-		copy(subscriberPayload, payload)
-
+	// Memory optimization: batch allocate copies to reduce allocation overhead
+	if len(snapshot) == 1 {
+		// Single subscriber - can share the payload directly
 		select {
-		case ch <- subscriberPayload:
+		case snapshot[0] <- payload:
 			hub.deliveredFrames.Add(1)
 			b.totals.addDelivered(hashTopic(topic), 1)
 		default:
-			// Subscriber is slow/full, drop them
-			b.dropSlowSubscriber(hub, shard, ch, topic)
+			b.dropSlowSubscriber(hub, shard, snapshot[0], topic)
+		}
+	} else {
+		// Multiple subscribers - batch allocate copies
+		copies := b.batchAllocatePayloads(payload, len(snapshot))
+		for i, ch := range snapshot {
+			select {
+			case ch <- copies[i]:
+				hub.deliveredFrames.Add(1)
+				b.totals.addDelivered(hashTopic(topic), 1)
+			default:
+				// Return unused copy to pool
+				byteSliceBuf.Put(copies[i])
+				b.dropSlowSubscriber(hub, shard, ch, topic)
+			}
 		}
 	}
 
 	*snapshotBuf = snapshot
-	// Return the shard payload to pool
+	// Return the original shard payload to pool
 	byteSliceBuf.Put(payload)
 }
 
@@ -880,6 +1301,35 @@ func (b *broker) dropSlowSubscriber(hub *topicHub, shard int, ch chan []byte, to
 		b.totals.addDropped(hashTopic(topic), 1)
 	}
 	hub.subsMu[shard].Unlock()
+}
+
+// batchAllocatePayloads efficiently creates copies for multiple subscribers
+func (b *broker) batchAllocatePayloads(payload []byte, count int) [][]byte {
+	copies := make([][]byte, count)
+	payloadLen := len(payload)
+	
+	// Allocate one large buffer and slice it up (more cache-friendly)
+	if count > 1 && payloadLen < 4096 { // Only for reasonable payload sizes
+		totalSize := payloadLen * count
+		bigBuffer := byteSliceBuf.Get(totalSize)
+		bigBuffer = bigBuffer[:totalSize]
+		
+		for i := 0; i < count; i++ {
+			start := i * payloadLen
+			end := start + payloadLen
+			copies[i] = bigBuffer[start:end]
+			copy(copies[i], payload)
+		}
+	} else {
+		// Fall back to individual allocations for large payloads
+		for i := 0; i < count; i++ {
+			copies[i] = byteSliceBuf.Get(payloadLen)
+			copies[i] = copies[i][:payloadLen]
+			copy(copies[i], payload)
+		}
+	}
+	
+	return copies
 }
 
 // startDispatcher starts the ring buffer dispatcher for a topic hub
@@ -920,11 +1370,17 @@ func (b *broker) Subscribe(topic string, clientBuf int) (<-chan []byte, func()) 
 	if b.cfg.FanoutShards <= 0 {
 		b.cfg.FanoutShards = 1 // Safety check
 	}
+	
+	// Update activity tracking
+	h.lastActivity.Store(time.Now().Unix())
+	h.isMarkedIdle.Store(false)
+	
 	// Safe conversion: modulo ensures result is always < FanoutShards
 	sh := int(atomic.AddUint32(&h.nextSh, 1)) % b.cfg.FanoutShards
 	h.subsMu[sh].Lock()
 	h.subs[sh][ch] = struct{}{}
 	h.subsMu[sh].Unlock()
+	
 	cancel := func() {
 		h.subsMu[sh].Lock()
 		if _, ok := h.subs[sh][ch]; ok {
@@ -932,6 +1388,8 @@ func (b *broker) Subscribe(topic string, clientBuf int) (<-chan []byte, func()) 
 			delete(h.subs[sh], ch)
 		}
 		h.subsMu[sh].Unlock()
+		// Update activity on unsubscribe as well
+		h.lastActivity.Store(time.Now().Unix())
 	}
 	return ch, cancel
 }

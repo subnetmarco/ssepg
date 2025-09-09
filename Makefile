@@ -80,6 +80,14 @@ example-auth: ## Run example with token authentication (requires DATABASE_URL, P
 	fi
 	go run examples/with-auth/main.go
 
+example-scale: ## Run high-scale example optimized for 100K+ clients (requires DATABASE_URL)
+	@if [ -z "$(DATABASE_URL)" ]; then \
+		echo "Please set DATABASE_URL environment variable"; \
+		echo "Example: make example-scale DATABASE_URL=postgres://postgres@localhost:5432/postgres?sslmode=disable"; \
+		exit 1; \
+	fi
+	go run examples/high-scale/main.go
+
 postgres-up: ## Start PostgreSQL with Docker Compose
 	docker-compose up -d postgres
 

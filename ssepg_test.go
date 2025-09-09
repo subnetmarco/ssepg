@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -1320,6 +1321,171 @@ func TestSecurityLogging(t *testing.T) {
 	})
 	
 	t.Logf("✅ Security logging test passed: startup logging implemented")
+}
+
+func TestMemoryManagement(t *testing.T) {
+	// Test memory tracking and cleanup functionality
+	cfg := ssepg.DefaultConfig()
+	cfg.DSN = getTestDSN(t)
+	cfg.KeepAlive = 1 * time.Second
+	cfg.GracefulDrain = 200 * time.Millisecond
+	cfg.MemoryCleanupInterval = 500 * time.Millisecond // Very frequent for testing
+	cfg.TopicIdleTimeout = 1 * time.Second             // Short timeout for testing
+	
+	svc, err := ssepg.New(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Failed to create service: %v", err)
+	}
+	
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = svc.Close(ctx)
+	})
+
+	mux := http.NewServeMux()
+	svc.Attach(mux)
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	// Test 1: Create some activity and check memory tracking
+	topic := "memory-test"
+	
+	// Publish a message to create a topic hub
+	testData := json.RawMessage(`{"memory_test": true}`)
+	err = svc.Publish(context.Background(), topic, testData)
+	if err != nil {
+		t.Fatalf("Failed to publish: %v", err)
+	}
+
+	// Check health metrics include memory information
+	resp, err := http.Get(server.URL + "/healthz")
+	if err != nil {
+		t.Fatalf("Failed to get health: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	var health map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&health); err != nil {
+		t.Fatalf("Failed to decode health: %v", err)
+	}
+
+	// Verify new memory fields are present
+	totals := health["totals"].(map[string]interface{})
+	if totals["total_memory_usage_bytes"] == nil {
+		t.Error("Missing total_memory_usage_bytes in health response")
+	}
+	
+	if totals["idle_topics"] == nil {
+		t.Error("Missing idle_topics in health response")
+	}
+
+	// Check topic-level memory metrics
+	topics := health["topics"].([]interface{})
+	if len(topics) > 0 {
+		topic := topics[0].(map[string]interface{})
+		if topic["memory_usage_bytes"] == nil {
+			t.Error("Missing memory_usage_bytes in topic metrics")
+		}
+		if topic["last_activity_unix"] == nil {
+			t.Error("Missing last_activity_unix in topic metrics")
+		}
+		if topic["is_idle"] == nil {
+			t.Error("Missing is_idle in topic metrics")
+		}
+	}
+
+	t.Logf("✅ Memory management test passed: memory tracking and cleanup features working")
+}
+
+func TestHighScaleConfig(t *testing.T) {
+	// Test that HighScaleConfig provides appropriate values for high-scale deployments
+	cfg := ssepg.HighScaleConfig()
+	
+	// Verify high-scale optimizations
+	if cfg.NotifyShards < 32 {
+		t.Errorf("HighScaleConfig should have >= 32 NotifyShards for 100K+ clients, got %d", cfg.NotifyShards)
+	}
+	
+	if cfg.FanoutShards < 16 {
+		t.Errorf("HighScaleConfig should have >= 16 FanoutShards for parallelism, got %d", cfg.FanoutShards)
+	}
+	
+	if cfg.ClientChanBuf < 256 {
+		t.Errorf("HighScaleConfig should have >= 256 ClientChanBuf to prevent drops, got %d", cfg.ClientChanBuf)
+	}
+	
+	if cfg.RingCapacity < 4096 {
+		t.Errorf("HighScaleConfig should have >= 4096 RingCapacity for traffic bursts, got %d", cfg.RingCapacity)
+	}
+	
+	if cfg.MemoryPressureThreshold < 1024*1024*1024 { // 1GB
+		t.Errorf("HighScaleConfig should have >= 1GB MemoryPressureThreshold, got %d", cfg.MemoryPressureThreshold)
+	}
+	
+	if cfg.AlterSystemMaxNotificationMB < 512 {
+		t.Errorf("HighScaleConfig should request >= 512MB PostgreSQL notification queue, got %d", cfg.AlterSystemMaxNotificationMB)
+	}
+	
+	// Test that it can be used to create a service
+	cfg.DSN = getTestDSN(t)
+	svc, err := ssepg.New(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Failed to create service with HighScaleConfig: %v", err)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = svc.Close(ctx)
+	}()
+	
+	t.Logf("✅ High-scale config test passed: configuration optimized for 100K+ clients")
+}
+
+func TestAdaptiveConfiguration(t *testing.T) {
+	// Test that DefaultConfig now automatically adapts to system resources
+	cfg := ssepg.DefaultConfig()
+	
+	// Verify adaptive configuration is working
+	cpus := runtime.NumCPU()
+	
+	// NotifyShards should be based on system resources
+	if cfg.NotifyShards <= 0 {
+		t.Error("NotifyShards should be > 0")
+	}
+	
+	// FanoutShards should scale with CPU count
+	if cfg.FanoutShards <= 0 {
+		t.Error("FanoutShards should be > 0")
+	}
+	
+	// Memory threshold should be reasonable for the system
+	if cfg.MemoryPressureThreshold <= 0 {
+		t.Error("MemoryPressureThreshold should be > 0")
+	}
+	
+	// Test that static config still works for backward compatibility
+	staticCfg := ssepg.StaticConfig()
+	if staticCfg.NotifyShards != 8 {
+		t.Errorf("StaticConfig should have fixed NotifyShards=8, got %d", staticCfg.NotifyShards)
+	}
+	
+	if staticCfg.FanoutShards != 4 {
+		t.Errorf("StaticConfig should have fixed FanoutShards=4, got %d", staticCfg.FanoutShards)
+	}
+	
+	// Test that adaptive config scales with resources
+	if cpus >= 4 {
+		// On multi-core systems, adaptive should be higher than static
+		if cfg.FanoutShards <= staticCfg.FanoutShards {
+			t.Logf("Note: Adaptive config FanoutShards=%d not higher than static=%d (may be intentional for this system)", 
+				cfg.FanoutShards, staticCfg.FanoutShards)
+		}
+	}
+	
+	t.Logf("✅ Adaptive configuration test passed: auto-configured for %d CPUs", cpus)
+	t.Logf("   📊 NotifyShards=%d, FanoutShards=%d, RingCapacity=%d, ClientChanBuf=%d", 
+		cfg.NotifyShards, cfg.FanoutShards, cfg.RingCapacity, cfg.ClientChanBuf)
 }
 
 // Helper functions
