@@ -186,7 +186,7 @@ type postBody struct {
 func (s *Service) handleTopic() http.HandlerFunc {
 	base := strings.TrimRight(s.cfg.BasePath, "/") + "/"
 	const eventsPath = "events"
-	
+
 	return func(w http.ResponseWriter, r *http.Request) {
 		topic, parts, ok := s.parseTopicRequest(w, r, base)
 		if !ok {
@@ -698,7 +698,7 @@ func (b *broker) deliverToShard(topic string, hub *topicHub, shard int, payload 
 		byteSliceBuf.Put(payload)
 		return
 	}
-	
+
 	// Reuse snapshot slice
 	var snapshot []chan []byte
 	if cap(*snapshotBuf) >= subCount {
@@ -710,7 +710,7 @@ func (b *broker) deliverToShard(topic string, hub *topicHub, shard int, payload 
 		snapshot = append(snapshot, ch)
 	}
 	hub.subsMu[shard].RUnlock()
-	
+
 	// Deliver to all subscribers
 	for _, ch := range snapshot {
 		select {
@@ -721,7 +721,7 @@ func (b *broker) deliverToShard(topic string, hub *topicHub, shard int, payload 
 			b.dropSlowSubscriber(hub, shard, ch, topic)
 		}
 	}
-	
+
 	*snapshotBuf = snapshot
 	byteSliceBuf.Put(payload)
 }
@@ -941,7 +941,7 @@ func (b *broker) lastNotificationAt() time.Time {
 type bufferPool struct{ pool sync.Pool }
 
 func (p *bufferPool) Get() *bytes.Buffer  { return p.pool.Get().(*bytes.Buffer) }
-func (p *bufferPool) Put(b *bytes.Buffer) { b.Reset(); p.pool.Put(b) }
+func (p *bufferPool) Put(b *bytes.Buffer) { b.Reset(); p.pool.Put(b) } //nolint:staticcheck
 
 type messagePool struct{ pool sync.Pool }
 
@@ -957,7 +957,7 @@ func (p *byteSlicePool) Get(minCap int) []byte {
 	b := p.pool.Get().([]byte)
 	if cap(b) < minCap {
 		// If pooled slice is too small, return a new one
-		p.pool.Put(b)
+		p.pool.Put(b) //nolint:staticcheck
 		return make([]byte, 0, minCap)
 	}
 	return b[:0] // reset length but keep capacity
@@ -966,7 +966,7 @@ func (p *byteSlicePool) Put(b []byte) {
 	if cap(b) > 64*1024 { // Don't pool very large slices
 		return
 	}
-	p.pool.Put(b)
+	p.pool.Put(b) //nolint:staticcheck
 }
 
 // Memory pools for high-frequency allocations
