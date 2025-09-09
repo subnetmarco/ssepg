@@ -17,7 +17,7 @@ import (
 )
 
 // Test database URL - uses testcontainers or local postgres
-func getTestDSN(t *testing.T) string {
+func getTestDSN(_ *testing.T) string {
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {
 		dsn = "postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable"
@@ -42,7 +42,7 @@ func setupTestService(t *testing.T) (*ssepg.Service, *http.ServeMux) {
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		svc.Close(ctx)
+		_ = svc.Close(ctx)
 		// Give a small grace period for cleanup
 		time.Sleep(100 * time.Millisecond)
 	})
@@ -67,7 +67,7 @@ func TestBasicPublishSubscribe(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to connect to SSE: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.Header.Get("Content-Type") != "text/event-stream" {
 		t.Errorf("Expected Content-Type text/event-stream, got %s", resp.Header.Get("Content-Type"))
@@ -76,12 +76,13 @@ func TestBasicPublishSubscribe(t *testing.T) {
 	// Channel to receive messages
 	messages := make(chan map[string]interface{}, 10)
 	go func() {
+		const messageEvent = "message"
 		scanner := NewSSEScanner(resp.Body)
 		for scanner.Scan() {
 			event := scanner.Event()
-			if event.Event == "message" && event.Data != "" {
+			if event.Event == messageEvent && event.Data != "" {
 				var data map[string]interface{}
-				if err := json.Unmarshal([]byte(event.Data), &data); err == nil {
+				if jsonErr := json.Unmarshal([]byte(event.Data), &data); jsonErr == nil {
 					messages <- data
 				}
 			}
@@ -101,7 +102,7 @@ func TestBasicPublishSubscribe(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to publish: %v", err)
 	}
-	defer publishResp.Body.Close()
+	defer func() { _ = publishResp.Body.Close() }()
 
 	if publishResp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(publishResp.Body)
@@ -147,13 +148,13 @@ func TestTopicIsolation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to connect to topic1 SSE: %v", err)
 	}
-	defer resp1.Body.Close()
+	defer func() { _ = resp1.Body.Close() }()
 
 	resp2, err := http.Get(server.URL + "/topics/" + topic2 + "/events")
 	if err != nil {
 		t.Fatalf("Failed to connect to topic2 SSE: %v", err)
 	}
-	defer resp2.Body.Close()
+	defer func() { _ = resp2.Body.Close() }()
 
 	// Channels for messages
 	messages1 := make(chan map[string]interface{}, 10)
@@ -167,11 +168,11 @@ func TestTopicIsolation(t *testing.T) {
 
 	// Publish to topic1
 	payload1, _ := json.Marshal(map[string]interface{}{"data": map[string]string{"topic": "1"}})
-	http.Post(server.URL+"/topics/"+topic1+"/events", "application/json", bytes.NewBuffer(payload1))
+	_, _ = http.Post(server.URL+"/topics/"+topic1+"/events", "application/json", bytes.NewBuffer(payload1))
 
 	// Publish to topic2
 	payload2, _ := json.Marshal(map[string]interface{}{"data": map[string]string{"topic": "2"}})
-	http.Post(server.URL+"/topics/"+topic2+"/events", "application/json", bytes.NewBuffer(payload2))
+	_, _ = http.Post(server.URL+"/topics/"+topic2+"/events", "application/json", bytes.NewBuffer(payload2))
 
 	// Verify topic1 only gets its message
 	select {
@@ -218,7 +219,6 @@ func TestMultipleSubscribers(t *testing.T) {
 	numSubscribers := 5
 
 	// Create multiple subscribers
-	var subscribers []*http.Response
 	var messageChannels []chan map[string]interface{}
 
 	for i := 0; i < numSubscribers; i++ {
@@ -226,12 +226,11 @@ func TestMultipleSubscribers(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Failed to connect subscriber %d: %v", i, err)
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 
 		messages := make(chan map[string]interface{}, 10)
 		go readSSEMessages(resp.Body, messages)
 
-		subscribers = append(subscribers, resp)
 		messageChannels = append(messageChannels, messages)
 	}
 
@@ -240,7 +239,7 @@ func TestMultipleSubscribers(t *testing.T) {
 	// Publish a message
 	testData := map[string]interface{}{"subscriber_test": true, "id": 12345}
 	payload, _ := json.Marshal(map[string]interface{}{"data": testData})
-	http.Post(server.URL+"/topics/"+topic+"/events", "application/json", bytes.NewBuffer(payload))
+	_, _ = http.Post(server.URL+"/topics/"+topic+"/events", "application/json", bytes.NewBuffer(payload))
 
 	// Verify all subscribers receive the message
 	var wg sync.WaitGroup
@@ -346,7 +345,7 @@ func TestInvalidRequests(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Request failed: %v", err)
 			}
-			defer resp.Body.Close()
+			defer func() { _ = resp.Body.Close() }()
 
 			if resp.StatusCode != tt.expectedStatus {
 				bodyBytes, _ := io.ReadAll(resp.Body)
@@ -363,13 +362,13 @@ func TestHealthEndpoint(t *testing.T) {
 
 	// Publish some messages to generate metrics
 	testData := json.RawMessage(`{"test": true}`)
-	svc.Publish(context.Background(), "health-test", testData)
+	_ = svc.Publish(context.Background(), "health-test", testData)
 
 	resp, err := http.Get(server.URL + "/healthz")
 	if err != nil {
 		t.Fatalf("Health check failed: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("Expected status 200, got %d", resp.StatusCode)
@@ -407,7 +406,7 @@ func TestSSEHeartbeat(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to connect to SSE: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	// Read raw data to look for heartbeat comments
 	buffer := make([]byte, 1024)
@@ -448,7 +447,7 @@ func TestGzipCompression(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to connect to SSE: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.Header.Get("Content-Encoding") != "gzip" {
 		t.Errorf("Expected gzip encoding, got %s", resp.Header.Get("Content-Encoding"))
@@ -458,12 +457,13 @@ func TestGzipCompression(t *testing.T) {
 // Helper functions
 
 func readSSEMessages(body io.Reader, messages chan<- map[string]interface{}) {
+	const messageEvent = "message"
 	scanner := NewSSEScanner(body)
 	for scanner.Scan() {
 		event := scanner.Event()
-		if event.Event == "message" && event.Data != "" {
+		if event.Event == messageEvent && event.Data != "" {
 			var data map[string]interface{}
-			if err := json.Unmarshal([]byte(event.Data), &data); err == nil {
+			if jsonErr := json.Unmarshal([]byte(event.Data), &data); jsonErr == nil {
 				messages <- data
 			}
 		}

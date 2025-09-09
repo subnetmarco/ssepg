@@ -248,74 +248,68 @@ func (s *Service) handlePublish(w http.ResponseWriter, r *http.Request, topic st
 
 // handleSubscribe processes GET requests for SSE subscriptions
 func (s *Service) handleSubscribe(w http.ResponseWriter, r *http.Request, topic string) {
-			w.Header().Set("Content-Type", "text/event-stream")
-			w.Header().Set("Cache-Control", "no-cache")
-			w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
 
-			flusher, ok := w.(http.Flusher)
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+
+	bw := bufio.NewWriterSize(w, s.cfg.SSEBufSize)
+	var out io.Writer = bw
+	var zw *gzip.Writer
+	if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+		w.Header().Set("Content-Encoding", "gzip")
+		zw = gzip.NewWriter(bw)
+		out = zw
+	}
+
+	stream, cancel := s.br.Subscribe(topic, s.cfg.ClientChanBuf)
+	defer cancel()
+
+	s.sendSSEMessage(out, ": listening "+topic+"\n\n", flusher, zw, bw)
+
+	t := time.NewTicker(s.cfg.KeepAlive)
+	defer t.Stop()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-t.C:
+			s.sendSSEMessage(out, ": keep-alive\n\n", flusher, zw, bw)
+		case payload, ok := <-stream:
 			if !ok {
-				http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+				s.sendSSEMessage(out, ": server shutting down\n\n", flusher, zw, bw)
+				if zw != nil {
+					_ = zw.Close()
+				}
 				return
 			}
-
-			bw := bufio.NewWriterSize(w, s.cfg.SSEBufSize)
-			var out io.Writer = bw
-			var zw *gzip.Writer
-			if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
-				w.Header().Set("Content-Encoding", "gzip")
-				zw = gzip.NewWriter(bw)
-				out = zw
+			if err := writeSSE(out, "message", "", payload); err != nil {
+				return
 			}
-
-			stream, cancel := s.br.Subscribe(topic, s.cfg.ClientChanBuf)
-			defer cancel()
-
-			_, _ = io.WriteString(out, ": listening "+topic+"\n\n")
-			if zw != nil {
-				_ = zw.Flush()
-			}
-			_ = bw.Flush()
-			flusher.Flush()
-
-			t := time.NewTicker(s.cfg.KeepAlive)
-			defer t.Stop()
-
-			for {
-				select {
-				case <-r.Context().Done():
-					return
-				case <-t.C:
-					_, _ = io.WriteString(out, ": keep-alive\n\n")
-					if zw != nil {
-						_ = zw.Flush()
-					}
-					_ = bw.Flush()
-					flusher.Flush()
-				case payload, ok := <-stream:
-					if !ok {
-						_, _ = io.WriteString(out, ": server shutting down\n\n")
-						if zw != nil {
-							_ = zw.Flush()
-							_ = zw.Close()
-						}
-						_ = bw.Flush()
-						flusher.Flush()
-						return
-					}
-					if err := writeSSE(out, "message", "", payload); err != nil {
-						return
-					}
-					if zw != nil {
-						_ = zw.Flush()
-					}
-					_ = bw.Flush()
-					flusher.Flush()
-				}
-			}
+			s.flushSSE(flusher, zw, bw)
 		}
-
-		http.NotFound(w, r)
 	}
+}
+
+// sendSSEMessage sends a message and flushes the SSE stream
+func (s *Service) sendSSEMessage(out io.Writer, message string, flusher http.Flusher, zw *gzip.Writer, bw *bufio.Writer) {
+	_, _ = io.WriteString(out, message)
+	s.flushSSE(flusher, zw, bw)
+}
+
+// flushSSE flushes all layers of the SSE output stream
+func (s *Service) flushSSE(flusher http.Flusher, zw *gzip.Writer, bw *bufio.Writer) {
+	if zw != nil {
+		_ = zw.Flush()
+	}
+	_ = bw.Flush()
+	flusher.Flush()
 }
 
 func (s *Service) handleHealthz() http.HandlerFunc {
@@ -656,91 +650,116 @@ func (b *broker) hub(topic string) *topicHub {
 	}
 	shard.topics[topic] = h
 
-	// fanout workers
+	// Start fanout workers
+	b.startFanoutWorkers(topic, h)
+
+	// Start dispatcher
+	b.startDispatcher(topic, h)
+
+	return h
+}
+
+// startFanoutWorkers starts the fanout worker goroutines for a topic hub
+func (b *broker) startFanoutWorkers(topic string, hub *topicHub) {
 	for i := 0; i < b.cfg.FanoutShards; i++ {
 		idx := i
-		go func(tp string, hub *topicHub, shard int) {
+		go func(tp string, h *topicHub, shard int) {
 			// Reusable snapshot buffer to reduce allocations
 			var snapshotBuf []chan []byte
 			for {
 				select {
-				case <-hub.quit:
-					hub.subsMu[shard].Lock()
-					for ch := range hub.subs[shard] {
-						close(ch)
-						delete(hub.subs[shard], ch)
-					}
-					hub.subsMu[shard].Unlock()
+				case <-h.quit:
+					b.cleanupFanoutShard(h, shard)
 					return
-				case payload := <-hub.fanout[shard]:
-					// snapshot then deliver - reuse slice to reduce allocations
-					hub.subsMu[shard].RLock()
-					subCount := len(hub.subs[shard])
-					if subCount == 0 {
-						hub.subsMu[shard].RUnlock()
-						// Return payload buffer to pool when no subscribers
-						byteSliceBuf.Put(payload)
-						continue
-					}
-					// Reuse snapshot slice - allocate once per worker
-					var snapshot []chan []byte
-					if cap(snapshotBuf) >= subCount {
-						snapshot = snapshotBuf[:0]
-					} else {
-						snapshot = make([]chan []byte, 0, subCount)
-					}
-					for ch := range hub.subs[shard] {
-						snapshot = append(snapshot, ch)
-					}
-					hub.subsMu[shard].RUnlock()
-					for _, ch := range snapshot {
-						select {
-						case ch <- payload:
-							hub.deliveredFrames.Add(1)
-							b.totals.addDelivered(hashTopic(tp), 1)
-						default:
-							hub.subsMu[shard].Lock()
-							if _, ok := hub.subs[shard][ch]; ok {
-								close(ch)
-								delete(hub.subs[shard], ch)
-								hub.droppedClients.Add(1)
-								b.totals.addDropped(hashTopic(tp), 1)
-							}
-							hub.subsMu[shard].Unlock()
-						}
-					}
-					// Store snapshot buffer for reuse
-					snapshotBuf = snapshot
-					// Return payload buffer to pool after all deliveries
-					byteSliceBuf.Put(payload)
+				case payload := <-h.fanout[shard]:
+					b.deliverToShard(tp, h, shard, payload, &snapshotBuf)
 				}
 			}
-		}(topic, h, idx)
+		}(topic, hub, idx)
 	}
+}
 
-	// dispatcher: drain ring & hand payload to each fanout shard
-	go func(tp string, hub *topicHub) {
+// cleanupFanoutShard closes all subscribers in a fanout shard
+func (b *broker) cleanupFanoutShard(hub *topicHub, shard int) {
+	hub.subsMu[shard].Lock()
+	for ch := range hub.subs[shard] {
+		close(ch)
+		delete(hub.subs[shard], ch)
+	}
+	hub.subsMu[shard].Unlock()
+}
+
+// deliverToShard delivers a payload to all subscribers in a fanout shard
+func (b *broker) deliverToShard(topic string, hub *topicHub, shard int, payload []byte, snapshotBuf *[]chan []byte) {
+	hub.subsMu[shard].RLock()
+	subCount := len(hub.subs[shard])
+	if subCount == 0 {
+		hub.subsMu[shard].RUnlock()
+		byteSliceBuf.Put(payload)
+		return
+	}
+	
+	// Reuse snapshot slice
+	var snapshot []chan []byte
+	if cap(*snapshotBuf) >= subCount {
+		snapshot = (*snapshotBuf)[:0]
+	} else {
+		snapshot = make([]chan []byte, 0, subCount)
+	}
+	for ch := range hub.subs[shard] {
+		snapshot = append(snapshot, ch)
+	}
+	hub.subsMu[shard].RUnlock()
+	
+	// Deliver to all subscribers
+	for _, ch := range snapshot {
+		select {
+		case ch <- payload:
+			hub.deliveredFrames.Add(1)
+			b.totals.addDelivered(hashTopic(topic), 1)
+		default:
+			b.dropSlowSubscriber(hub, shard, ch, topic)
+		}
+	}
+	
+	*snapshotBuf = snapshot
+	byteSliceBuf.Put(payload)
+}
+
+// dropSlowSubscriber removes a slow/full subscriber
+func (b *broker) dropSlowSubscriber(hub *topicHub, shard int, ch chan []byte, topic string) {
+	hub.subsMu[shard].Lock()
+	if _, ok := hub.subs[shard][ch]; ok {
+		close(ch)
+		delete(hub.subs[shard], ch)
+		hub.droppedClients.Add(1)
+		b.totals.addDropped(hashTopic(topic), 1)
+	}
+	hub.subsMu[shard].Unlock()
+}
+
+// startDispatcher starts the ring buffer dispatcher for a topic hub
+func (b *broker) startDispatcher(topic string, hub *topicHub) {
+	go func(tp string, h *topicHub) {
 		for {
 			select {
-			case <-hub.quit:
+			case <-h.quit:
 				return
-			case <-hub.notify:
+			case <-h.notify:
 				for {
-					payload, ok := hub.dequeue()
+					payload, ok := h.dequeue()
 					if !ok {
 						break
 					}
-					hub.broadcast.Add(1)
+					h.broadcast.Add(1)
 					b.totals.addBroadcast(hashTopic(tp), 1)
 					for i := 0; i < b.cfg.FanoutShards; i++ {
-						hub.fanout[i] <- payload
+						h.fanout[i] <- payload
 					}
 				}
 			}
 		}
-	}(topic, h)
-
-	return h
+	}(topic, hub)
 }
 
 func (b *broker) Subscribe(topic string, clientBuf int) (<-chan []byte, func()) {

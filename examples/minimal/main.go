@@ -34,7 +34,11 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer svc.Close(context.Background())
+	defer func() {
+		if err := svc.Close(context.Background()); err != nil {
+			log.Printf("Error closing service: %v", err)
+		}
+	}()
 
 	mux := http.NewServeMux()
 	svc.Attach(mux)
