@@ -1348,12 +1348,17 @@ func (b *broker) startDispatcher(topic string, hub *topicHub) {
 					h.broadcast.Add(1)
 					b.totals.addBroadcast(hashTopic(tp), 1)
 
-					// Send a copy to each fanout shard to avoid races
+					// Create copies for each fanout shard sequentially to avoid races
+					copies := make([][]byte, b.cfg.FanoutShards)
 					for i := 0; i < b.cfg.FanoutShards; i++ {
-						shardPayload := byteSliceBuf.Get(len(payload))
-						shardPayload = shardPayload[:len(payload)]
-						copy(shardPayload, payload)
-						h.fanout[i] <- shardPayload
+						copies[i] = byteSliceBuf.Get(len(payload))
+						copies[i] = copies[i][:len(payload)]
+						copy(copies[i], payload)
+					}
+
+					// Send copies to fanout shards
+					for i := 0; i < b.cfg.FanoutShards; i++ {
+						h.fanout[i] <- copies[i]
 					}
 
 					// Return original payload to pool
