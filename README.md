@@ -169,8 +169,9 @@ make fmt
 # Run example locally (requires PostgreSQL)
 DATABASE_URL=postgres://postgres@localhost:5432/postgres?sslmode=disable make example
 
-# Or use Docker Compose for full setup
-docker-compose up
+# Or start PostgreSQL with Docker and run example locally
+make postgres-up
+DATABASE_URL=postgres://ssepg:ssepg@localhost:5432/ssepg?sslmode=disable make example
 ```
 
 ### CI/CD

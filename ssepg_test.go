@@ -40,9 +40,11 @@ func setupTestService(t *testing.T) (*ssepg.Service, *http.ServeMux) {
 	svc.Attach(mux)
 
 	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		svc.Close(ctx)
+		// Give a small grace period for cleanup
+		time.Sleep(100 * time.Millisecond)
 	})
 
 	return svc, mux

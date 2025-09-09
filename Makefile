@@ -26,6 +26,9 @@ test-coverage: ## Run tests with coverage
 lint: ## Run linter
 	golangci-lint run
 
+security: ## Run security scan
+	gosec ./...
+
 fmt: ## Format code
 	go fmt ./...
 	goimports -w .
@@ -43,6 +46,7 @@ clean: ## Clean build artifacts
 
 install-tools: ## Install development tools
 	go install golang.org/x/tools/cmd/goimports@latest
+	go install github.com/securego/gosec/v2/cmd/gosec@latest
 	curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(go env GOPATH)/bin
 
 dev-setup: install-tools mod-tidy ## Set up development environment
@@ -56,5 +60,8 @@ example: ## Run the minimal example (requires DATABASE_URL)
 	fi
 	go run examples/minimal/main.go
 
-docker-example: ## Run example in Docker with PostgreSQL
-	docker-compose up --build
+postgres-up: ## Start PostgreSQL with Docker Compose
+	docker-compose up -d postgres
+
+postgres-down: ## Stop PostgreSQL
+	docker-compose down

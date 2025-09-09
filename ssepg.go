@@ -503,9 +503,12 @@ type broker struct {
 	// Sharded topic storage for reduced contention
 	topicShards [topicShards]topicShard
 
-	draining atomic.Bool
-	lastNote atomic.Int64
-	totals   totals
+	draining       atomic.Bool
+	lastNote       atomic.Int64
+	totals         totals
+	shutdownCtx    context.Context
+	shutdownCancel context.CancelFunc
+	shutdownDone   chan struct{}
 }
 
 func shardName(i int) string { return fmt.Sprintf("topic_broadcast_%d", i) }
@@ -523,7 +526,7 @@ func newBroker(ctx context.Context, cfg Config) (*broker, error) {
 	}
 	nc, err := pgx.Connect(ctx, cfg.DSN)
 	if err != nil {
-		lc.Close(ctx)
+		_ = lc.Close(ctx)
 		return nil, err
 	}
 	shards := make([]string, cfg.NotifyShards)
@@ -531,19 +534,23 @@ func newBroker(ctx context.Context, cfg Config) (*broker, error) {
 	for i := 0; i < cfg.NotifyShards; i++ {
 		ch := shardName(i)
 		if _, err := lc.Exec(ctx, fmt.Sprintf(`LISTEN "%s"`, ch)); err != nil {
-			lc.Close(ctx)
-			nc.Close(ctx)
+			_ = lc.Close(ctx)
+			_ = nc.Close(ctx)
 			return nil, fmt.Errorf("LISTEN %s failed: %w", ch, err)
 		}
 		shards[i] = ch
 		prefix[i] = []byte(`NOTIFY "` + ch + `", '`)
 	}
+	shutdownCtx, shutdownCancel := context.WithCancel(context.Background())
 	b := &broker{
-		cfg:        cfg,
-		notifyConn: nc,
-		listenConn: lc,
-		shards:     shards,
-		notifyPref: prefix,
+		cfg:            cfg,
+		notifyConn:     nc,
+		listenConn:     lc,
+		shards:         shards,
+		notifyPref:     prefix,
+		shutdownCtx:    shutdownCtx,
+		shutdownCancel: shutdownCancel,
+		shutdownDone:   make(chan struct{}),
 	}
 	// Initialize topic shards
 	for i := range b.topicShards {
@@ -712,7 +719,11 @@ func (b *broker) hub(topic string) *topicHub {
 func (b *broker) Subscribe(topic string, clientBuf int) (<-chan []byte, func()) {
 	h := b.hub(topic)
 	ch := make(chan []byte, clientBuf)
-	sh := atomic.AddUint32(&h.nextSh, 1) % uint32(b.cfg.FanoutShards)
+	if b.cfg.FanoutShards <= 0 {
+		b.cfg.FanoutShards = 1 // Safety check
+	}
+	// Safe conversion: modulo ensures result is always < FanoutShards
+	sh := int(atomic.AddUint32(&h.nextSh, 1)) % b.cfg.FanoutShards
 	h.subsMu[sh].Lock()
 	h.subs[sh][ch] = struct{}{}
 	h.subsMu[sh].Unlock()
@@ -756,7 +767,11 @@ func (b *broker) Publish(ctx context.Context, topic string, data json.RawMessage
 	}
 
 	h := hashTopic(topic)
-	si := int(h % uint32(b.cfg.NotifyShards))
+	if b.cfg.NotifyShards <= 0 {
+		b.cfg.NotifyShards = 1 // Safety check
+	}
+	// Safe conversion: modulo ensures result is always < NotifyShards
+	si := int(h) % b.cfg.NotifyShards
 	sqlBuf := jsonBuf.Get()
 	defer jsonBuf.Put(sqlBuf)
 	sqlBuf.Reset()
@@ -774,7 +789,16 @@ func (b *broker) Publish(ctx context.Context, topic string, data json.RawMessage
 }
 
 func (b *broker) notificationLoop(ctx context.Context) {
+	defer close(b.shutdownDone)
+	
 	for {
+		// Check if we should shutdown
+		select {
+		case <-b.shutdownCtx.Done():
+			return
+		default:
+		}
+		
 		n, err := b.listenConn.WaitForNotification(ctx)
 		if err != nil {
 			if b.draining.Load() || errors.Is(err, context.Canceled) {
@@ -801,6 +825,23 @@ func (b *broker) notificationLoop(ctx context.Context) {
 
 func (b *broker) Shutdown(ctx context.Context) {
 	b.draining.Store(true)
+	
+	// Signal notification loop to stop
+	b.shutdownCancel()
+	
+	// Wait for notification loop to finish with timeout
+	select {
+	case <-b.shutdownDone:
+		// Notification loop finished gracefully
+	case <-time.After(2 * time.Second):
+		// Timeout waiting for notification loop
+		log.Printf("ssepg: timeout waiting for notification loop to stop")
+	}
+	
+	// Now it's safe to close connections
+	_ = b.listenConn.Close(ctx)
+	_ = b.notifyConn.Close(ctx)
+	
 	// drain rings (bounded)
 	deadline := time.Now().Add(b.cfg.GracefulDrain)
 	for time.Now().Before(deadline) {
@@ -809,6 +850,7 @@ func (b *broker) Shutdown(ctx context.Context) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
+	
 	// close hubs across all shards
 	for i := range b.topicShards {
 		shard := &b.topicShards[i]
@@ -819,8 +861,6 @@ func (b *broker) Shutdown(ctx context.Context) {
 		}
 		shard.mu.Unlock()
 	}
-	_ = b.listenConn.Close(ctx)
-	_ = b.notifyConn.Close(ctx)
 }
 
 func (b *broker) allRingsEmpty() bool {
