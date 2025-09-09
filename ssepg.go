@@ -35,6 +35,12 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
+// Message is the wire format carried in LISTEN/NOTIFY.
+type Message struct {
+	Topic string          `json:"topic"`
+	Data  json.RawMessage `json:"data"`
+}
+
 // ---------- Configuration ----------
 
 type Config struct {
