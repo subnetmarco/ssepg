@@ -1,56 +1,37 @@
 package main
 
 import (
-	"context"
 	"log"
 	"net/http"
-	"os"
-	"time"
 
 	_ "go.uber.org/automaxprocs"
 
-	"github.com/jackc/pgx/v5/pgxpool" // optional, just to validate DSN early
 	"github.com/subnetmarco/ssepg"
+	"github.com/subnetmarco/ssepg/examples/shared"
 )
 
 func main() {
-	dsn := os.Getenv("DATABASE_URL")
-	if dsn == "" {
-		log.Fatal("Set DATABASE_URL (e.g. postgres://postgres@localhost:5432/postgres?sslmode=disable)")
-	}
-
-	// optional: validate DSN quickly
-	if _, err := pgxpool.ParseConfig(dsn); err != nil {
-		log.Fatalf("bad DATABASE_URL: %v", err)
-	}
-
+	// Configuration with separate health port for security isolation
 	cfg := ssepg.DefaultConfig()
-	cfg.DSN = dsn
+	cfg.DSN = shared.MustGetDSN()
 	cfg.HealthPort = ":9090" // Health metrics on separate port
 
-	svc, err := ssepg.New(context.Background(), cfg)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer func() {
-		if err := svc.Close(context.Background()); err != nil {
-			log.Printf("Error closing service: %v", err)
-		}
-	}()
+	svc := shared.MustCreateService(cfg)
+	defer shared.GracefulServiceShutdown(svc)
 
-	// Main application server (public-facing)
+	// Main application server (public-facing, no health endpoint)
 	mux := http.NewServeMux()
-	svc.Attach(mux) // Only topics endpoints, no health
+	svc.Attach(mux) // Only topics endpoints, health is on separate port
 
-	srv := &http.Server{
-		Addr:              ":8080",
-		Handler:           mux,
-		ReadHeaderTimeout: 5 * time.Second,
-		IdleTimeout:       70 * time.Second, // SSE friendly
-	}
+	srv := shared.CreateHTTPServer(":8080", mux)
 
-	log.Println("🚀 Main server on :8080 (topics)")
-	log.Println("📊 Health server on :9090 (metrics)")
+	log.Println("🚀 Main server on :8080 (topics only)")
+	log.Println("📊 Health server on :9090 (metrics only)")
+	log.Println("")
+	log.Println("✨ Benefits of separate health port:")
+	log.Println("   • Security: Health metrics isolated from public traffic")
+	log.Println("   • Monitoring: Dedicated port for load balancers/monitoring")
+	log.Println("   • Performance: No health check overhead on main port")
 	log.Println("")
 	log.Println("Try:")
 	log.Println("  curl -N http://localhost:8080/topics/test/events")
@@ -61,4 +42,3 @@ func main() {
 		log.Fatal(err)
 	}
 }
-

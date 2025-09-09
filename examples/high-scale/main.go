@@ -1,32 +1,20 @@
 package main
 
 import (
-	"context"
 	"log"
 	"net/http"
-	"os"
 	"time"
 
 	_ "go.uber.org/automaxprocs"
 
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/subnetmarco/ssepg"
+	"github.com/subnetmarco/ssepg/examples/shared"
 )
 
 func main() {
-	dsn := os.Getenv("DATABASE_URL")
-	if dsn == "" {
-		log.Fatal("Set DATABASE_URL (e.g. postgres://postgres@localhost:5432/postgres?sslmode=disable)")
-	}
-
-	// Validate DSN
-	if _, err := pgxpool.ParseConfig(dsn); err != nil {
-		log.Fatalf("bad DATABASE_URL: %v", err)
-	}
-
 	// Start with adaptive configuration, then apply high-scale overrides
 	cfg := ssepg.DefaultConfig()
-	cfg.DSN = dsn
+	cfg.DSN = shared.MustGetDSN()
 	cfg.HealthPort = ":9090" // Separate health port for security
 	
 	// Manual overrides for extreme scale (500K+ concurrent clients)
@@ -46,23 +34,17 @@ func main() {
 	log.Printf("   🔧 PostgreSQL queue: %d MB (requires superuser)", cfg.AlterSystemMaxNotificationMB)
 	log.Println()
 
-	svc, err := ssepg.New(context.Background(), cfg)
-	if err != nil {
-		log.Fatal(err)
-	}
+	svc := shared.MustCreateService(cfg)
 	defer func() {
-		log.Println("🛑 Shutting down...")
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		if err := svc.Close(ctx); err != nil {
-			log.Printf("Error closing service: %v", err)
-		}
+		log.Println("🛑 Shutting down high-scale server...")
+		shared.GracefulServiceShutdown(svc)
 	}()
 
 	// Main application server (optimized for high concurrency)
 	mux := http.NewServeMux()
 	svc.Attach(mux)
 
+	// High-scale server configuration
 	srv := &http.Server{
 		Addr:              ":8080",
 		Handler:           mux,
