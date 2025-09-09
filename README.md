@@ -5,7 +5,7 @@
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
 Zero-persistence, topic-based **Server-Sent Events** (SSE) fanout using **Postgres LISTEN/NOTIFY**.  
-Works across multiple app instances behind a load balancer. No tables or storage required.
+**Horizontally scalable** across multiple app instances behind a load balancer. No tables or storage required.
 
 **Created by AI and perfected under Marco's supervision**
 
@@ -129,6 +129,32 @@ cfg.AlterSystemMaxNotificationMB = 64
 * Ordering: best-effort per topic per instance.
 * Payload size: keep data ≤ ~8KB due to NOTIFY limits.
 * Backpressure: slow clients are dropped (channel full); clients should reconnect.
+
+## Horizontal Scaling
+
+ssepg is designed for **horizontal scaling** across multiple instances:
+
+```
+┌─────────────┐    ┌─────────────┐    ┌─────────────┐
+│   ssepg     │    │   ssepg     │    │   ssepg     │
+│ Instance 1  │    │ Instance 2  │    │ Instance 3  │
+│   :8080     │    │   :8081     │    │   :8082     │
+└─────────────┘    └─────────────┘    └─────────────┘
+       │                   │                   │
+       └───────────────────┼───────────────────┘
+                           │
+                  ┌─────────────────┐
+                  │   PostgreSQL    │
+                  │ LISTEN/NOTIFY   │
+                  └─────────────────┘
+```
+
+**Key Features:**
+- **Publish anywhere**: Message published to any instance reaches all subscribers
+- **Subscribe anywhere**: Clients can connect to any instance via load balancer  
+- **Shared state**: PostgreSQL coordinates message delivery across instances
+- **No coordination**: Instances don't need to know about each other
+- **Load balancer friendly**: Works with round-robin, least-connections, etc.
 
 ## Operational Notes
 

@@ -454,6 +454,168 @@ func TestGzipCompression(t *testing.T) {
 	}
 }
 
+func TestHorizontalScaling(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping horizontal scaling test in short mode")
+	}
+
+	// This test verifies that multiple ssepg instances can communicate
+	// via PostgreSQL LISTEN/NOTIFY, simulating a load-balanced deployment
+	
+	dsn := getTestDSN(t)
+	cfg := ssepg.DefaultConfig()
+	cfg.DSN = dsn
+	cfg.KeepAlive = 1 * time.Second // Faster for tests
+	cfg.GracefulDrain = 1 * time.Second
+
+	// Create two separate service instances (simulating different servers)
+	svc1, err := ssepg.New(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Failed to create service 1: %v", err)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = svc1.Close(ctx)
+	}()
+
+	svc2, err := ssepg.New(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Failed to create service 2: %v", err)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = svc2.Close(ctx)
+	}()
+
+	// Create HTTP servers for both instances
+	mux1 := http.NewServeMux()
+	svc1.Attach(mux1)
+	server1 := httptest.NewServer(mux1)
+	defer server1.Close()
+
+	mux2 := http.NewServeMux()
+	svc2.Attach(mux2)
+	server2 := httptest.NewServer(mux2)
+	defer server2.Close()
+
+	topic := "horizontal-scale-test"
+
+	// Subscribe to events on instance 1
+	resp1, err := http.Get(server1.URL + "/topics/" + topic + "/events")
+	if err != nil {
+		t.Fatalf("Failed to connect to instance 1 SSE: %v", err)
+	}
+	defer func() { _ = resp1.Body.Close() }()
+
+	// Subscribe to events on instance 2 
+	resp2, err := http.Get(server2.URL + "/topics/" + topic + "/events")
+	if err != nil {
+		t.Fatalf("Failed to connect to instance 2 SSE: %v", err)
+	}
+	defer func() { _ = resp2.Body.Close() }()
+
+	// Channels to collect messages from both instances
+	messages1 := make(chan map[string]interface{}, 10)
+	messages2 := make(chan map[string]interface{}, 10)
+
+	// Start reading from both SSE streams
+	go readSSEMessages(resp1.Body, messages1)
+	go readSSEMessages(resp2.Body, messages2)
+
+	// Give connections time to establish
+	time.Sleep(200 * time.Millisecond)
+
+	// Test 1: Publish to instance 1, both instances should receive
+	testData1 := map[string]interface{}{"source": "instance1", "msg": "hello from 1"}
+	payload1, _ := json.Marshal(map[string]interface{}{"data": testData1})
+	
+	resp, err := http.Post(server1.URL+"/topics/"+topic+"/events", "application/json", bytes.NewBuffer(payload1))
+	if err != nil {
+		t.Fatalf("Failed to publish to instance 1: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	// Both instances should receive the message
+	var received1, received2 map[string]interface{}
+	
+	select {
+	case received1 = <-messages1:
+		if received1["source"] != "instance1" {
+			t.Errorf("Instance 1 received wrong message: %v", received1)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Instance 1 didn't receive message published to instance 1")
+	}
+
+	select {
+	case received2 = <-messages2:
+		if received2["source"] != "instance1" {
+			t.Errorf("Instance 2 received wrong message: %v", received2)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Instance 2 didn't receive message published to instance 1")
+	}
+
+	// Test 2: Publish to instance 2, both instances should receive
+	testData2 := map[string]interface{}{"source": "instance2", "msg": "hello from 2"}
+	payload2, _ := json.Marshal(map[string]interface{}{"data": testData2})
+	
+	resp, err = http.Post(server2.URL+"/topics/"+topic+"/events", "application/json", bytes.NewBuffer(payload2))
+	if err != nil {
+		t.Fatalf("Failed to publish to instance 2: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	// Both instances should receive the message
+	select {
+	case received1 = <-messages1:
+		if received1["source"] != "instance2" {
+			t.Errorf("Instance 1 received wrong message: %v", received1)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Instance 1 didn't receive message published to instance 2")
+	}
+
+	select {
+	case received2 = <-messages2:
+		if received2["source"] != "instance2" {
+			t.Errorf("Instance 2 received wrong message: %v", received2)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Instance 2 didn't receive message published to instance 2")
+	}
+
+	// Test 3: Programmatic publish to instance 1, both should receive
+	testData3 := json.RawMessage(`{"source":"programmatic","msg":"direct publish"}`)
+	err = svc1.Publish(context.Background(), topic, testData3)
+	if err != nil {
+		t.Fatalf("Programmatic publish failed: %v", err)
+	}
+
+	// Both instances should receive the programmatic message
+	select {
+	case received1 = <-messages1:
+		if received1["source"] != "programmatic" {
+			t.Errorf("Instance 1 received wrong programmatic message: %v", received1)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Instance 1 didn't receive programmatic message")
+	}
+
+	select {
+	case received2 = <-messages2:
+		if received2["source"] != "programmatic" {
+			t.Errorf("Instance 2 received wrong programmatic message: %v", received2)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Instance 2 didn't receive programmatic message")
+	}
+
+	t.Logf("✅ Horizontal scaling test passed: both instances received all messages regardless of publish source")
+}
+
 // Helper functions
 
 func readSSEMessages(body io.Reader, messages chan<- map[string]interface{}) {

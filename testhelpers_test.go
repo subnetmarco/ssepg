@@ -70,5 +70,6 @@ func TestWithTestcontainers(t *testing.T) {
 	// Run a subset of tests with the containerized database
 	t.Run("BasicPublishSubscribe", TestBasicPublishSubscribe)
 	t.Run("TopicIsolation", TestTopicIsolation)
+	t.Run("HorizontalScaling", TestHorizontalScaling)
 	t.Run("HealthEndpoint", TestHealthEndpoint)
 }
