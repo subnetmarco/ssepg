@@ -207,16 +207,16 @@ func calculateOptimalConfig() Config {
 	cpus := runtime.NumCPU()
 
 	cfg := Config{
-		BasePath:               "/topics",
-		Healthz:                "/healthz",
-		KeepAlive:              15 * time.Second,
-		SSEBufSize:             32 << 10,
-		MaxNotifyBytes:         7900,
-		GracefulDrain:          10 * time.Second,
-		QueueWarnThreshold:     0.5,
-		QueuePollInterval:      30 * time.Second,
-		MemoryCleanupInterval:  5 * time.Minute,
-		TopicIdleTimeout:       10 * time.Minute,
+		BasePath:                "/topics",
+		Healthz:                 "/healthz",
+		KeepAlive:               15 * time.Second,
+		SSEBufSize:              32 << 10,
+		MaxNotifyBytes:          7900,
+		GracefulDrain:           10 * time.Second,
+		QueueWarnThreshold:      0.5,
+		QueuePollInterval:       30 * time.Second,
+		MemoryCleanupInterval:   5 * time.Minute,
+		TopicIdleTimeout:        10 * time.Minute,
 		MemoryPressureThreshold: 100 * 1024 * 1024,
 	}
 
@@ -595,8 +595,9 @@ func (s *Service) handleSubscribe(w http.ResponseWriter, r *http.Request, topic 
 	}
 
 	// SSE & proxy-friendly headers
-	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache, no-transform")
+	w.Header().Set("Pragma", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no") // NGINX: disable buffering
 	// Transfer-Encoding: chunked is implicit for streamed responses
@@ -988,9 +989,10 @@ func newBroker(ctx context.Context, cfg Config) (*broker, error) {
 	for i := range b.topicShards {
 		b.topicShards[i].topics = make(map[string]*topicHub)
 	}
-	go b.notificationLoop(ctx)
-	go b.queueUsageMonitor(ctx)
-	go b.memoryCleanupMonitor(ctx)
+	// Use cancelable broker context so goroutines stop on Shutdown()
+	go b.notificationLoop(b.shutdownCtx)
+	go b.queueUsageMonitor(b.shutdownCtx)
+	go b.memoryCleanupMonitor(b.shutdownCtx)
 
 	if mb := cfg.AlterSystemMaxNotificationMB; mb > 0 {
 		_, err := nc.Exec(ctx, `ALTER SYSTEM SET max_notification_queue_size = '`+fmt.Sprint(mb)+`MB'`)
