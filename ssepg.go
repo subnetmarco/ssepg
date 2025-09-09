@@ -502,6 +502,10 @@ func (s *Service) handleTopic() http.HandlerFunc {
 		if len(parts) == 2 && parts[1] == eventsPath {
 			switch r.Method {
 			case http.MethodPost:
+				// Add Vary: Authorization if publish is protected
+				if s.cfg.PublishToken != "" {
+					w.Header().Add("Vary", "Authorization")
+				}
 				// AuthZ hook (optional)
 				if s.cfg.Authorize != nil {
 					if err := s.cfg.Authorize(r, topic, "publish"); err != nil {
@@ -511,6 +515,10 @@ func (s *Service) handleTopic() http.HandlerFunc {
 				}
 				s.handlePublish(w, r, topic)
 			case http.MethodGet:
+				// Add Vary: Authorization if subscribe is protected
+				if s.cfg.ListenToken != "" {
+					w.Header().Add("Vary", "Authorization")
+				}
 				if s.cfg.Authorize != nil {
 					if err := s.cfg.Authorize(r, topic, "subscribe"); err != nil {
 						http.Error(w, err.Error(), http.StatusForbidden)
@@ -603,6 +611,10 @@ func (s *Service) handleSubscribe(w http.ResponseWriter, r *http.Request, topic 
 	// Transfer-Encoding: chunked is implicit for streamed responses
 	// Add Vary for gzip negotiation
 	w.Header().Add("Vary", "Accept-Encoding")
+	// Add Vary: Authorization if protected (already set in router; harmless to duplicate)
+	if s.cfg.ListenToken != "" {
+		w.Header().Add("Vary", "Authorization")
+	}
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
