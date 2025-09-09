@@ -185,109 +185,130 @@ type postBody struct {
 
 func (s *Service) handleTopic() http.HandlerFunc {
 	base := strings.TrimRight(s.cfg.BasePath, "/") + "/"
+	const eventsPath = "events"
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !strings.HasPrefix(r.URL.Path, base) {
-			http.NotFound(w, r)
-			return
-		}
-		rest := strings.TrimPrefix(r.URL.Path, base)
-		parts := strings.Split(rest, "/")
-		if len(parts) == 0 || parts[0] == "" {
-			http.NotFound(w, r)
-			return
-		}
-		topic, ok := normalizeTopic(parts[0])
+		topic, parts, ok := s.parseTopicRequest(w, r, base)
 		if !ok {
-			http.Error(w, "invalid topic (allowed [a-z0-9_-]{1,128})", http.StatusBadRequest)
-			return
+			return // Error already sent
 		}
 
 		// Publish
-		if r.Method == http.MethodPost && len(parts) == 2 && parts[1] == "events" {
-			r.Body = http.MaxBytesReader(w, r.Body, 256<<10) // 256KB
-			var body postBody
-			if err := json.NewDecoder(r.Body).Decode(&body); err != nil || len(body.Data) == 0 || string(body.Data) == "null" {
-				http.Error(w, "invalid JSON; expected {\"data\": ...}", http.StatusBadRequest)
-				return
-			}
-			if err := s.br.Publish(r.Context(), topic, body.Data); err != nil {
-				http.Error(w, "publish error: "+err.Error(), http.StatusServiceUnavailable)
-				return
-			}
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]any{"topic": topic, "data": body.Data})
+		if r.Method == http.MethodPost && len(parts) == 2 && parts[1] == eventsPath {
+			s.handlePublish(w, r, topic)
 			return
 		}
 
 		// Subscribe SSE
-		if r.Method == http.MethodGet && len(parts) == 2 && parts[1] == "events" {
-			w.Header().Set("Content-Type", "text/event-stream")
-			w.Header().Set("Cache-Control", "no-cache")
-			w.Header().Set("Connection", "keep-alive")
+		if r.Method == http.MethodGet && len(parts) == 2 && parts[1] == eventsPath {
+			s.handleSubscribe(w, r, topic)
+			return
+		}
 
-			flusher, ok := w.(http.Flusher)
-			if !ok {
-				http.Error(w, "streaming unsupported", http.StatusInternalServerError)
-				return
-			}
+		http.NotFound(w, r)
+	}
+}
 
-			bw := bufio.NewWriterSize(w, s.cfg.SSEBufSize)
-			var out io.Writer = bw
-			var zw *gzip.Writer
-			if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
-				w.Header().Set("Content-Encoding", "gzip")
-				zw = gzip.NewWriter(bw)
-				out = zw
-			}
+// parseTopicRequest extracts and validates topic from request path
+func (s *Service) parseTopicRequest(w http.ResponseWriter, r *http.Request, base string) (string, []string, bool) {
+	if !strings.HasPrefix(r.URL.Path, base) {
+		http.NotFound(w, r)
+		return "", nil, false
+	}
+	rest := strings.TrimPrefix(r.URL.Path, base)
+	parts := strings.Split(rest, "/")
+	if len(parts) == 0 || parts[0] == "" {
+		http.NotFound(w, r)
+		return "", nil, false
+	}
+	topic, ok := normalizeTopic(parts[0])
+	if !ok {
+		http.Error(w, "invalid topic (allowed [a-z0-9_-]{1,128})", http.StatusBadRequest)
+		return "", nil, false
+	}
+	return topic, parts, true
+}
 
-			stream, cancel := s.br.Subscribe(topic, s.cfg.ClientChanBuf)
-			defer cancel()
+// handlePublish processes POST requests to publish messages
+func (s *Service) handlePublish(w http.ResponseWriter, r *http.Request, topic string) {
+	r.Body = http.MaxBytesReader(w, r.Body, 256<<10) // 256KB
+	var body postBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || len(body.Data) == 0 || string(body.Data) == "null" {
+		http.Error(w, "invalid JSON; expected {\"data\": ...}", http.StatusBadRequest)
+		return
+	}
+	if err := s.br.Publish(r.Context(), topic, body.Data); err != nil {
+		http.Error(w, "publish error: "+err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"topic": topic, "data": body.Data})
+}
 
-			_, _ = io.WriteString(out, ": listening "+topic+"\n\n")
+// handleSubscribe processes GET requests for SSE subscriptions
+func (s *Service) handleSubscribe(w http.ResponseWriter, r *http.Request, topic string) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+
+	bw := bufio.NewWriterSize(w, s.cfg.SSEBufSize)
+	var out io.Writer = bw
+	var zw *gzip.Writer
+	if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+		w.Header().Set("Content-Encoding", "gzip")
+		zw = gzip.NewWriter(bw)
+		out = zw
+	}
+
+	stream, cancel := s.br.Subscribe(topic, s.cfg.ClientChanBuf)
+	defer cancel()
+
+	_, _ = io.WriteString(out, ": listening "+topic+"\n\n")
+	if zw != nil {
+		_ = zw.Flush()
+	}
+	_ = bw.Flush()
+	flusher.Flush()
+
+	t := time.NewTicker(s.cfg.KeepAlive)
+	defer t.Stop()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-t.C:
+			_, _ = io.WriteString(out, ": keep-alive\n\n")
 			if zw != nil {
 				_ = zw.Flush()
 			}
 			_ = bw.Flush()
 			flusher.Flush()
-
-			t := time.NewTicker(s.cfg.KeepAlive)
-			defer t.Stop()
-
-			for {
-				select {
-				case <-r.Context().Done():
-					return
-				case <-t.C:
-					_, _ = io.WriteString(out, ": keep-alive\n\n")
-					if zw != nil {
-						_ = zw.Flush()
-					}
-					_ = bw.Flush()
-					flusher.Flush()
-				case payload, ok := <-stream:
-					if !ok {
-						_, _ = io.WriteString(out, ": server shutting down\n\n")
-						if zw != nil {
-							_ = zw.Flush()
-							_ = zw.Close()
-						}
-						_ = bw.Flush()
-						flusher.Flush()
-						return
-					}
-					if err := writeSSE(out, "message", "", payload); err != nil {
-						return
-					}
-					if zw != nil {
-						_ = zw.Flush()
-					}
-					_ = bw.Flush()
-					flusher.Flush()
+		case payload, ok := <-stream:
+			if !ok {
+				_, _ = io.WriteString(out, ": server shutting down\n\n")
+				if zw != nil {
+					_ = zw.Flush()
+					_ = zw.Close()
 				}
+				_ = bw.Flush()
+				flusher.Flush()
+				return
 			}
+			if err := writeSSE(out, "message", "", payload); err != nil {
+				return
+			}
+			if zw != nil {
+				_ = zw.Flush()
+			}
+			_ = bw.Flush()
+			flusher.Flush()
 		}
-
-		http.NotFound(w, r)
 	}
 }
 
@@ -790,24 +811,35 @@ func (b *broker) Publish(ctx context.Context, topic string, data json.RawMessage
 
 func (b *broker) notificationLoop(ctx context.Context) {
 	defer close(b.shutdownDone)
-	
+
 	for {
-		// Check if we should shutdown
+		// Check if we should shutdown before each wait
+		if b.draining.Load() {
+			return
+		}
+		
 		select {
 		case <-b.shutdownCtx.Done():
 			return
 		default:
 		}
-		
-		n, err := b.listenConn.WaitForNotification(ctx)
+
+		n, err := b.listenConn.WaitForNotification(b.shutdownCtx)
 		if err != nil {
 			if b.draining.Load() || errors.Is(err, context.Canceled) {
 				return
 			}
 			log.Printf("ssepg: listen error: %v (retrying in 1s)", err)
-			time.Sleep(time.Second)
+			
+			// Interruptible sleep
+			select {
+			case <-time.After(time.Second):
+			case <-b.shutdownCtx.Done():
+				return
+			}
 			continue
 		}
+		
 		b.lastNote.Store(time.Now().UnixNano())
 
 		// Use pooled message struct
@@ -825,23 +857,29 @@ func (b *broker) notificationLoop(ctx context.Context) {
 
 func (b *broker) Shutdown(ctx context.Context) {
 	b.draining.Store(true)
-	
+
 	// Signal notification loop to stop
 	b.shutdownCancel()
-	
+
 	// Wait for notification loop to finish with timeout
+	shutdownTimer := time.NewTimer(1 * time.Second)
+	defer shutdownTimer.Stop()
+	
 	select {
 	case <-b.shutdownDone:
 		// Notification loop finished gracefully
-	case <-time.After(2 * time.Second):
+	case <-shutdownTimer.C:
 		// Timeout waiting for notification loop
 		log.Printf("ssepg: timeout waiting for notification loop to stop")
+	case <-ctx.Done():
+		// Context cancelled
+		log.Printf("ssepg: shutdown context cancelled")
 	}
-	
+
 	// Now it's safe to close connections
 	_ = b.listenConn.Close(ctx)
 	_ = b.notifyConn.Close(ctx)
-	
+
 	// drain rings (bounded)
 	deadline := time.Now().Add(b.cfg.GracefulDrain)
 	for time.Now().Before(deadline) {
@@ -850,7 +888,7 @@ func (b *broker) Shutdown(ctx context.Context) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	
+
 	// close hubs across all shards
 	for i := range b.topicShards {
 		shard := &b.topicShards[i]
@@ -911,7 +949,7 @@ func (p *byteSlicePool) Get(minCap int) []byte {
 	b := p.pool.Get().([]byte)
 	if cap(b) < minCap {
 		// If pooled slice is too small, return a new one
-		p.pool.Put(b)
+		p.pool.Put(b) //nolint:staticcheck // sync.Pool.Put expects interface{}
 		return make([]byte, 0, minCap)
 	}
 	return b[:0] // reset length but keep capacity
@@ -920,7 +958,7 @@ func (p *byteSlicePool) Put(b []byte) {
 	if cap(b) > 64*1024 { // Don't pool very large slices
 		return
 	}
-	p.pool.Put(b)
+	p.pool.Put(b) //nolint:staticcheck // sync.Pool.Put expects interface{}
 }
 
 // Memory pools for high-frequency allocations
