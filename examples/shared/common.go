@@ -17,12 +17,12 @@ func MustGetDSN() string {
 	if dsn == "" {
 		log.Fatal("Set DATABASE_URL (e.g. postgres://postgres@localhost:5432/postgres?sslmode=disable)")
 	}
-	
+
 	// Validate DSN format
 	if _, err := pgxpool.ParseConfig(dsn); err != nil {
 		log.Fatalf("Invalid DATABASE_URL: %v", err)
 	}
-	
+
 	return dsn
 }
 

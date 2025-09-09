@@ -16,14 +16,14 @@ func main() {
 	cfg := ssepg.DefaultConfig()
 	cfg.DSN = shared.MustGetDSN()
 	cfg.HealthPort = ":9090" // Separate health port for security
-	
+
 	// Manual overrides for extreme scale (500K+ concurrent clients)
-	cfg.RingCapacity = 32768                             // 4x larger ring buffers
-	cfg.ClientChanBuf = 2048                             // 4x larger client buffers  
+	cfg.RingCapacity = 32768                              // 4x larger ring buffers
+	cfg.ClientChanBuf = 2048                              // 4x larger client buffers
 	cfg.MemoryPressureThreshold = 50 * 1024 * 1024 * 1024 // 50GB threshold
-	cfg.GracefulDrain = 60 * time.Second                 // Longer drain time
-	cfg.QueuePollInterval = 5 * time.Second              // More aggressive monitoring
-	cfg.MemoryCleanupInterval = 1 * time.Minute          // More frequent cleanup
+	cfg.GracefulDrain = 60 * time.Second                  // Longer drain time
+	cfg.QueuePollInterval = 5 * time.Second               // More aggressive monitoring
+	cfg.MemoryCleanupInterval = 1 * time.Minute           // More frequent cleanup
 
 	log.Println("🚀 Starting ssepg in HIGH-SCALE mode (adaptive + manual overrides)")
 	log.Printf("   📊 NotifyShards: %d (auto-adapted to CPU cores)", cfg.NotifyShards)
@@ -49,9 +49,9 @@ func main() {
 		Addr:              ":8080",
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
-		WriteTimeout:      0,  // No write timeout for SSE
+		WriteTimeout:      0,                 // No write timeout for SSE
 		IdleTimeout:       120 * time.Second, // Longer for many connections
-		MaxHeaderBytes:    8 << 10, // 8KB headers
+		MaxHeaderBytes:    8 << 10,           // 8KB headers
 	}
 
 	log.Println("🌐 High-scale server ready:")

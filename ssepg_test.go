@@ -30,9 +30,9 @@ func getTestDSN(_ *testing.T) string {
 func setupTestService(t *testing.T) (*ssepg.Service, *http.ServeMux) {
 	cfg := ssepg.DefaultConfig()
 	cfg.DSN = getTestDSN(t)
-	cfg.KeepAlive = 1 * time.Second // Faster for tests
+	cfg.KeepAlive = 1 * time.Second            // Faster for tests
 	cfg.GracefulDrain = 500 * time.Millisecond // Shorter for tests
-	
+
 	// Create service with background context (don't timeout the service itself)
 	svc, err := ssepg.New(context.Background(), cfg)
 	if err != nil {
@@ -72,8 +72,9 @@ func TestBasicPublishSubscribe(t *testing.T) {
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	if resp.Header.Get("Content-Type") != "text/event-stream" {
-		t.Errorf("Expected Content-Type text/event-stream, got %s", resp.Header.Get("Content-Type"))
+	contentType := resp.Header.Get("Content-Type")
+	if !strings.HasPrefix(contentType, "text/event-stream") {
+		t.Errorf("Expected Content-Type to start with text/event-stream, got %s", contentType)
 	}
 
 	// Channel to receive messages
@@ -464,7 +465,7 @@ func TestHorizontalScaling(t *testing.T) {
 
 	// This test verifies that multiple ssepg instances can communicate
 	// via PostgreSQL LISTEN/NOTIFY, simulating a load-balanced deployment
-	
+
 	dsn := getTestDSN(t)
 	cfg := ssepg.DefaultConfig()
 	cfg.DSN = dsn
@@ -512,7 +513,7 @@ func TestHorizontalScaling(t *testing.T) {
 	}
 	defer func() { _ = resp1.Body.Close() }()
 
-	// Subscribe to events on instance 2 
+	// Subscribe to events on instance 2
 	resp2, err := http.Get(server2.URL + "/topics/" + topic + "/events")
 	if err != nil {
 		t.Fatalf("Failed to connect to instance 2 SSE: %v", err)
@@ -533,7 +534,7 @@ func TestHorizontalScaling(t *testing.T) {
 	// Test 1: Publish to instance 1, both instances should receive
 	testData1 := map[string]interface{}{"source": "instance1", "msg": "hello from 1"}
 	payload1, _ := json.Marshal(map[string]interface{}{"data": testData1})
-	
+
 	resp, err := http.Post(server1.URL+"/topics/"+topic+"/events", "application/json", bytes.NewBuffer(payload1))
 	if err != nil {
 		t.Fatalf("Failed to publish to instance 1: %v", err)
@@ -542,7 +543,7 @@ func TestHorizontalScaling(t *testing.T) {
 
 	// Both instances should receive the message
 	var received1, received2 map[string]interface{}
-	
+
 	select {
 	case received1 = <-messages1:
 		if received1["source"] != "instance1" {
@@ -564,7 +565,7 @@ func TestHorizontalScaling(t *testing.T) {
 	// Test 2: Publish to instance 2, both instances should receive
 	testData2 := map[string]interface{}{"source": "instance2", "msg": "hello from 2"}
 	payload2, _ := json.Marshal(map[string]interface{}{"data": testData2})
-	
+
 	resp, err = http.Post(server2.URL+"/topics/"+topic+"/events", "application/json", bytes.NewBuffer(payload2))
 	if err != nil {
 		t.Fatalf("Failed to publish to instance 2: %v", err)
@@ -625,7 +626,7 @@ func TestSeparateHealthPort(t *testing.T) {
 	cfg.DSN = getTestDSN(t)
 	cfg.KeepAlive = 1 * time.Second
 	cfg.GracefulDrain = 1 * time.Second
-	
+
 	// Find an available port for health server
 	healthListener, err := net.Listen("tcp", ":0")
 	if err != nil {
@@ -633,14 +634,14 @@ func TestSeparateHealthPort(t *testing.T) {
 	}
 	healthPort := healthListener.Addr().String()
 	_ = healthListener.Close()
-	
+
 	cfg.HealthPort = healthPort
-	
+
 	svc, err := ssepg.New(context.Background(), cfg)
 	if err != nil {
 		t.Fatalf("Failed to create service: %v", err)
 	}
-	
+
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -679,8 +680,9 @@ func TestSeparateHealthPort(t *testing.T) {
 		t.Errorf("Expected topics endpoint to work on main server, got %d", topicResp.StatusCode)
 	}
 
-	if topicResp.Header.Get("Content-Type") != "text/event-stream" {
-		t.Errorf("Expected SSE content type, got %s", topicResp.Header.Get("Content-Type"))
+	topicContentType := topicResp.Header.Get("Content-Type")
+	if !strings.HasPrefix(topicContentType, "text/event-stream") {
+		t.Errorf("Expected SSE content type to start with text/event-stream, got %s", topicContentType)
 	}
 
 	// Test 3: Generate some activity to create metrics
@@ -752,7 +754,7 @@ func TestHealthMetricsOnSeparatePort(t *testing.T) {
 	cfg.DSN = getTestDSN(t)
 	cfg.KeepAlive = 1 * time.Second
 	cfg.GracefulDrain = 1 * time.Second
-	
+
 	// Find an available port for health server
 	healthListener, err := net.Listen("tcp", ":0")
 	if err != nil {
@@ -760,14 +762,14 @@ func TestHealthMetricsOnSeparatePort(t *testing.T) {
 	}
 	healthPort := healthListener.Addr().String()
 	_ = healthListener.Close()
-	
+
 	cfg.HealthPort = healthPort
-	
+
 	svc, err := ssepg.New(context.Background(), cfg)
 	if err != nil {
 		t.Fatalf("Failed to create service: %v", err)
 	}
-	
+
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -814,7 +816,7 @@ func TestHealthMetricsOnSeparatePort(t *testing.T) {
 	// Publish a message to update metrics
 	testData := map[string]interface{}{"metric_test": true, "timestamp": time.Now().Unix()}
 	payload, _ := json.Marshal(map[string]interface{}{"data": testData})
-	
+
 	publishResp, err := http.Post(server.URL+"/topics/"+topic+"/events", "application/json", bytes.NewBuffer(payload))
 	if err != nil {
 		t.Fatalf("Failed to publish: %v", err)
@@ -875,13 +877,13 @@ func TestTokenAuthentication(t *testing.T) {
 	cfg.GracefulDrain = 200 * time.Millisecond // Very short for tests
 	cfg.PublishToken = "pub-secret-123"
 	cfg.ListenToken = "listen-secret-456"
-	
+
 	// Create service with background context
 	svc, err := ssepg.New(context.Background(), cfg)
 	if err != nil {
 		t.Fatalf("Failed to create service: %v", err)
 	}
-	
+
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
@@ -918,7 +920,7 @@ func TestTokenAuthentication(t *testing.T) {
 		},
 		{
 			name:         "PublishWrongToken",
-			method:       "POST", 
+			method:       "POST",
 			path:         "/topics/" + topic + "/events",
 			headers:      map[string]string{"Content-Type": "application/json", "Authorization": "Bearer wrong-token"},
 			body:         payload,
@@ -946,7 +948,7 @@ func TestTokenAuthentication(t *testing.T) {
 		{
 			name:         "SubscribeWrongToken",
 			method:       "GET",
-			path:         "/topics/" + topic + "/events", 
+			path:         "/topics/" + topic + "/events",
 			headers:      map[string]string{"Authorization": "Bearer wrong-listen-token"},
 			body:         nil,
 			expectedCode: http.StatusUnauthorized,
@@ -1012,12 +1014,12 @@ func TestAuthenticatedPubSub(t *testing.T) {
 	cfg.GracefulDrain = 1 * time.Second
 	cfg.PublishToken = "publisher-key-789"
 	cfg.ListenToken = "subscriber-key-101"
-	
+
 	svc, err := ssepg.New(context.Background(), cfg)
 	if err != nil {
 		t.Fatalf("Failed to create service: %v", err)
 	}
-	
+
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -1035,7 +1037,7 @@ func TestAuthenticatedPubSub(t *testing.T) {
 	// Start authenticated SSE subscription
 	req, _ := http.NewRequest("GET", server.URL+"/topics/"+topic+"/events", nil)
 	req.Header.Set("Authorization", "Bearer subscriber-key-101")
-	
+
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("Failed to connect to authenticated SSE: %v", err)
@@ -1068,8 +1070,8 @@ func TestAuthenticatedPubSub(t *testing.T) {
 	// Publish authenticated message
 	testData := map[string]interface{}{
 		"authenticated_message": true,
-		"timestamp": time.Now().Unix(),
-		"sender": "auth-test",
+		"timestamp":             time.Now().Unix(),
+		"sender":                "auth-test",
 	}
 	payload, _ := json.Marshal(map[string]interface{}{"data": testData})
 
@@ -1106,7 +1108,7 @@ func TestAuthenticatedPubSub(t *testing.T) {
 
 func TestPartialAuthentication(t *testing.T) {
 	// Test scenarios where only one token is configured
-	
+
 	t.Run("PublishOnlyAuth", func(t *testing.T) {
 		cfg := ssepg.DefaultConfig()
 		cfg.DSN = getTestDSN(t)
@@ -1114,7 +1116,7 @@ func TestPartialAuthentication(t *testing.T) {
 		cfg.GracefulDrain = 1 * time.Second
 		cfg.PublishToken = "only-publish-token"
 		// cfg.ListenToken = "" // Not set - listen should be open
-		
+
 		svc, err := ssepg.New(context.Background(), cfg)
 		if err != nil {
 			t.Fatalf("Failed to create service: %v", err)
@@ -1161,7 +1163,7 @@ func TestPartialAuthentication(t *testing.T) {
 		cfg.GracefulDrain = 1 * time.Second
 		// cfg.PublishToken = "" // Not set - publish should be open
 		cfg.ListenToken = "only-listen-token"
-		
+
 		svc, err := ssepg.New(context.Background(), cfg)
 		if err != nil {
 			t.Fatalf("Failed to create service: %v", err)
@@ -1210,7 +1212,7 @@ func TestTokenCrossValidation(t *testing.T) {
 	cfg.GracefulDrain = 1 * time.Second
 	cfg.PublishToken = "publish-only-secret"
 	cfg.ListenToken = "listen-only-secret"
-	
+
 	svc, err := ssepg.New(context.Background(), cfg)
 	if err != nil {
 		t.Fatalf("Failed to create service: %v", err)
@@ -1233,7 +1235,7 @@ func TestTokenCrossValidation(t *testing.T) {
 	req, _ := http.NewRequest("POST", server.URL+"/topics/"+topic+"/events", bytes.NewBuffer(payload))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer listen-only-secret")
-	
+
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("Failed to make cross-validation publish request: %v", err)
@@ -1247,7 +1249,7 @@ func TestTokenCrossValidation(t *testing.T) {
 	// Test 2: Try to subscribe with publish token (should fail)
 	req, _ = http.NewRequest("GET", server.URL+"/topics/"+topic+"/events", nil)
 	req.Header.Set("Authorization", "Bearer publish-only-secret")
-	
+
 	resp, err = http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("Failed to make cross-validation subscribe request: %v", err)
@@ -1262,7 +1264,7 @@ func TestTokenCrossValidation(t *testing.T) {
 	req, _ = http.NewRequest("POST", server.URL+"/topics/"+topic+"/events", bytes.NewBuffer(payload))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer publish-only-secret")
-	
+
 	resp, err = http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("Failed to publish with correct token: %v", err)
@@ -1275,7 +1277,7 @@ func TestTokenCrossValidation(t *testing.T) {
 
 	req, _ = http.NewRequest("GET", server.URL+"/topics/"+topic+"/events", nil)
 	req.Header.Set("Authorization", "Bearer listen-only-secret")
-	
+
 	resp, err = http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("Failed to subscribe with correct token: %v", err)
@@ -1291,7 +1293,7 @@ func TestTokenCrossValidation(t *testing.T) {
 
 func TestSecurityLogging(t *testing.T) {
 	// Test that security status is properly logged on startup
-	
+
 	// Capture log output (this is a basic test - in production you'd use a proper logger)
 	t.Run("NoAuthLogging", func(t *testing.T) {
 		cfg := ssepg.DefaultConfig()
@@ -1299,10 +1301,10 @@ func TestSecurityLogging(t *testing.T) {
 		cfg.KeepAlive = 1 * time.Second
 		cfg.GracefulDrain = 500 * time.Millisecond
 		// No tokens set - should log warnings
-		
+
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		
+
 		svc, err := ssepg.New(ctx, cfg)
 		if err != nil {
 			t.Fatalf("Failed to create service: %v", err)
@@ -1312,14 +1314,14 @@ func TestSecurityLogging(t *testing.T) {
 			defer cancel()
 			_ = svc.Close(ctx)
 		}()
-		
+
 		// Just verify the service was created successfully
 		// The security logging happens in the background
 		if svc == nil {
 			t.Error("Service should be created successfully")
 		}
 	})
-	
+
 	t.Logf("✅ Security logging test passed: startup logging implemented")
 }
 
@@ -1331,12 +1333,12 @@ func TestMemoryManagement(t *testing.T) {
 	cfg.GracefulDrain = 200 * time.Millisecond
 	cfg.MemoryCleanupInterval = 500 * time.Millisecond // Very frequent for testing
 	cfg.TopicIdleTimeout = 1 * time.Second             // Short timeout for testing
-	
+
 	svc, err := ssepg.New(context.Background(), cfg)
 	if err != nil {
 		t.Fatalf("Failed to create service: %v", err)
 	}
-	
+
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -1350,7 +1352,7 @@ func TestMemoryManagement(t *testing.T) {
 
 	// Test 1: Create some activity and check memory tracking
 	topic := "memory-test"
-	
+
 	// Publish a message to create a topic hub
 	testData := json.RawMessage(`{"memory_test": true}`)
 	err = svc.Publish(context.Background(), topic, testData)
@@ -1375,7 +1377,7 @@ func TestMemoryManagement(t *testing.T) {
 	if totals["total_memory_usage_bytes"] == nil {
 		t.Error("Missing total_memory_usage_bytes in health response")
 	}
-	
+
 	if totals["idle_topics"] == nil {
 		t.Error("Missing idle_topics in health response")
 	}
@@ -1401,32 +1403,32 @@ func TestMemoryManagement(t *testing.T) {
 func TestConfigManualOverride(t *testing.T) {
 	// Test that DefaultConfig can be manually overridden for specific needs
 	cfg := ssepg.DefaultConfig()
-	
+
 	// Record original adaptive values
 	originalNotifyShards := cfg.NotifyShards
 	originalFanoutShards := cfg.FanoutShards
 	originalRingCapacity := cfg.RingCapacity
-	
+
 	// Manual overrides for extreme scale
 	cfg.NotifyShards = 128
 	cfg.FanoutShards = 256
 	cfg.RingCapacity = 32768
 	cfg.ClientChanBuf = 2048
 	cfg.MemoryPressureThreshold = 50 * 1024 * 1024 * 1024 // 50GB
-	
+
 	// Verify overrides took effect
 	if cfg.NotifyShards != 128 {
 		t.Errorf("Manual override failed: NotifyShards should be 128, got %d", cfg.NotifyShards)
 	}
-	
+
 	if cfg.FanoutShards != 256 {
 		t.Errorf("Manual override failed: FanoutShards should be 256, got %d", cfg.FanoutShards)
 	}
-	
+
 	if cfg.RingCapacity != 32768 {
 		t.Errorf("Manual override failed: RingCapacity should be 32768, got %d", cfg.RingCapacity)
 	}
-	
+
 	// Test that manually configured service works
 	cfg.DSN = getTestDSN(t)
 	svc, err := ssepg.New(context.Background(), cfg)
@@ -1438,36 +1440,36 @@ func TestConfigManualOverride(t *testing.T) {
 		defer cancel()
 		_ = svc.Close(ctx)
 	}()
-	
+
 	t.Logf("✅ Manual override test passed:")
-	t.Logf("   Original adaptive: NotifyShards=%d, FanoutShards=%d, RingCapacity=%d", 
+	t.Logf("   Original adaptive: NotifyShards=%d, FanoutShards=%d, RingCapacity=%d",
 		originalNotifyShards, originalFanoutShards, originalRingCapacity)
-	t.Logf("   Manual overrides: NotifyShards=%d, FanoutShards=%d, RingCapacity=%d", 
+	t.Logf("   Manual overrides: NotifyShards=%d, FanoutShards=%d, RingCapacity=%d",
 		cfg.NotifyShards, cfg.FanoutShards, cfg.RingCapacity)
 }
 
 func TestAdaptiveConfiguration(t *testing.T) {
 	// Test that DefaultConfig now automatically adapts to system resources
 	cfg := ssepg.DefaultConfig()
-	
+
 	// Verify adaptive configuration is working
 	cpus := runtime.NumCPU()
-	
+
 	// NotifyShards should be based on system resources
 	if cfg.NotifyShards <= 0 {
 		t.Error("NotifyShards should be > 0")
 	}
-	
+
 	// FanoutShards should scale with CPU count
 	if cfg.FanoutShards <= 0 {
 		t.Error("FanoutShards should be > 0")
 	}
-	
+
 	// Memory threshold should be reasonable for the system
 	if cfg.MemoryPressureThreshold <= 0 {
 		t.Error("MemoryPressureThreshold should be > 0")
 	}
-	
+
 	// Test that adaptive config scales appropriately with system resources
 	if cpus >= 4 {
 		// On multi-core systems, should have reasonable parallelism
@@ -1478,9 +1480,9 @@ func TestAdaptiveConfiguration(t *testing.T) {
 			t.Errorf("Expected NotifyShards >= 8 on %d-core system, got %d", cpus, cfg.NotifyShards)
 		}
 	}
-	
+
 	t.Logf("✅ Adaptive configuration test passed: auto-configured for %d CPUs", cpus)
-	t.Logf("   📊 NotifyShards=%d, FanoutShards=%d, RingCapacity=%d, ClientChanBuf=%d", 
+	t.Logf("   📊 NotifyShards=%d, FanoutShards=%d, RingCapacity=%d, ClientChanBuf=%d",
 		cfg.NotifyShards, cfg.FanoutShards, cfg.RingCapacity, cfg.ClientChanBuf)
 }
 

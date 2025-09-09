@@ -15,9 +15,9 @@ func main() {
 	// Configuration with token authentication and separate health port
 	cfg := ssepg.DefaultConfig()
 	cfg.DSN = shared.MustGetDSN()
-	cfg.HealthPort = ":9090"                           // Health on separate port
-	cfg.PublishToken = os.Getenv("PUBLISH_TOKEN")     // e.g. "pub-secret-abc123"
-	cfg.ListenToken = os.Getenv("LISTEN_TOKEN")       // e.g. "sub-secret-def456"
+	cfg.HealthPort = ":9090"                      // Health on separate port
+	cfg.PublishToken = os.Getenv("PUBLISH_TOKEN") // e.g. "pub-secret-abc123"
+	cfg.ListenToken = os.Getenv("LISTEN_TOKEN")   // e.g. "sub-secret-def456"
 
 	if cfg.PublishToken == "" || cfg.ListenToken == "" {
 		log.Fatal("Set PUBLISH_TOKEN and LISTEN_TOKEN environment variables for authentication")

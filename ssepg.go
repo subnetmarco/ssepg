@@ -1584,8 +1584,8 @@ func (p *byteSlicePool) Put(b []byte) {
 
 // Memory pools for high-frequency allocations (package singletons)
 var (
-	jsonBuf = &bufferPool{pool: sync.Pool{New: func() any { return new(bytes.Buffer) }}}
-	messageBuf = &messagePool{pool: sync.Pool{New: func() any { return new(Message) }}}
+	jsonBuf      = &bufferPool{pool: sync.Pool{New: func() any { return new(bytes.Buffer) }}}
+	messageBuf   = &messagePool{pool: sync.Pool{New: func() any { return new(Message) }}}
 	byteSliceBuf = &byteSlicePool{pool: sync.Pool{New: func() any {
 		// Start with 1KB slices, will grow as needed
 		return make([]byte, 0, 1024)
