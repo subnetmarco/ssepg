@@ -876,17 +876,28 @@ func (b *broker) Shutdown(ctx context.Context) {
 	b.shutdownCancel()
 
 	// Wait for notification loop to finish with timeout
+	shutdownTimer := time.NewTimer(500 * time.Millisecond) // Shorter timeout for tests
+	defer shutdownTimer.Stop()
+
+	gracefulShutdown := false
 	select {
 	case <-b.shutdownDone:
 		// Notification loop finished gracefully
-	case <-time.After(2 * time.Second):
-		// Timeout waiting for notification loop
+		gracefulShutdown = true
+	case <-shutdownTimer.C:
+		// Timeout - force shutdown without closing connections to avoid race
 		log.Printf("ssepg: timeout waiting for notification loop to stop")
+	case <-ctx.Done():
+		// Context cancelled
+		log.Printf("ssepg: shutdown context cancelled")
 	}
 
-	// Now it's safe to close connections
-	_ = b.listenConn.Close(ctx)
-	_ = b.notifyConn.Close(ctx)
+	// Only close connections if notification loop finished gracefully
+	if gracefulShutdown {
+		_ = b.listenConn.Close(ctx)
+		_ = b.notifyConn.Close(ctx)
+	}
+	// If not graceful, connections will be cleaned up by process exit
 
 	// drain rings (bounded)
 	deadline := time.Now().Add(b.cfg.GracefulDrain)

@@ -2,8 +2,6 @@
 
 [![CI](https://github.com/subnetmarco/ssepg/actions/workflows/ci.yml/badge.svg)](https://github.com/subnetmarco/ssepg/actions/workflows/ci.yml)
 [![Go Report Card](https://goreportcard.com/badge/github.com/subnetmarco/ssepg)](https://goreportcard.com/report/github.com/subnetmarco/ssepg)
-[![codecov](https://codecov.io/gh/subnetmarco/ssepg/branch/main/graph/badge.svg)](https://codecov.io/gh/subnetmarco/ssepg)
-[![Go Reference](https://pkg.go.dev/badge/github.com/subnetmarco/ssepg.svg)](https://pkg.go.dev/github.com/subnetmarco/ssepg)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
 Zero-persistence, topic-based **Server-Sent Events** (SSE) fanout using **Postgres LISTEN/NOTIFY**.  
