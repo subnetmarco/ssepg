@@ -47,13 +47,13 @@ type Message struct {
 
 // Constants for common sizes and limits
 const (
-	DefaultSSEBufferSize    = 32 << 10 // 32KB
-	DefaultMaxNotifyBytes   = 7900     // Postgres payload limit ~8KB
-	DefaultTopicShards      = 32       // Power of 2 for efficient modulo
-	MinFanoutBufferSize     = 16       // Minimum fanout channel buffer
-	MaxPooledSliceSize      = 64 << 10 // 64KB - don't pool larger slices
-	DefaultPoolSliceSize    = 1024     // 1KB - initial pool slice capacity
-	MaxSSEBufferGrowth      = 1 << 20  // 1MB - cap SSE buffer growth
+	DefaultSSEBufferSize  = 32 << 10 // 32KB
+	DefaultMaxNotifyBytes = 7900     // Postgres payload limit ~8KB
+	DefaultTopicShards    = 32       // Power of 2 for efficient modulo
+	MinFanoutBufferSize   = 16       // Minimum fanout channel buffer
+	MaxPooledSliceSize    = 64 << 10 // 64KB - don't pool larger slices
+	DefaultPoolSliceSize  = 1024     // 1KB - initial pool slice capacity
+	MaxSSEBufferGrowth    = 1 << 20  // 1MB - cap SSE buffer growth
 )
 
 // ---------- Configuration ----------
@@ -469,9 +469,9 @@ func normalizeTopic(s string) (string, bool) {
 	return x, topicRE.MatchString(x)
 }
 
-// validateToken checks if the request has the required Bearer token (constant-time)
-func validateToken(r *http.Request, requiredToken string) bool {
-	if requiredToken == "" {
+// validateToken checks if the request has the required Bearer token (constant-time-ish; padded)
+func validateToken(r *http.Request, required string) bool {
+	if required == "" {
 		return true // No token required
 	}
 	auth := r.Header.Get("Authorization")
@@ -483,10 +483,17 @@ func validateToken(r *http.Request, requiredToken string) bool {
 		return false
 	}
 	token = strings.TrimSpace(token)
-	if len(token) != len(requiredToken) {
-		return false
+
+	// Constant-time compare with length padding to avoid length oracle
+	max := len(token)
+	if len(required) > max {
+		max = len(required)
 	}
-	return subtle.ConstantTimeCompare([]byte(token), []byte(requiredToken)) == 1
+	tb := make([]byte, max)
+	rb := make([]byte, max)
+	copy(tb, token)
+	copy(rb, required)
+	return subtle.ConstantTimeCompare(tb, rb) == 1
 }
 
 // sendUnauthorized sends a 401 Unauthorized response
@@ -593,7 +600,19 @@ func (s *Service) handlePublish(w http.ResponseWriter, r *http.Request, topic st
 		http.Error(w, "invalid JSON; expected {\"data\": ...}", http.StatusBadRequest)
 		return
 	}
-	if err := s.br.Publish(r.Context(), topic, body.Data); err != nil {
+
+	// Pre-compact and size-check before hitting the broker
+	cData, err := compactJSON(body.Data)
+	if err != nil {
+		http.Error(w, "invalid JSON; expected {\"data\": ...}", http.StatusBadRequest)
+		return
+	}
+	if len(`{"topic":"","data":}`)+len(cData) > s.cfg.MaxNotifyBytes {
+		http.Error(w, fmt.Sprintf("payload too large for NOTIFY (>%d bytes)", s.cfg.MaxNotifyBytes), http.StatusRequestEntityTooLarge)
+		return
+	}
+
+	if err := s.br.publishCompact(r.Context(), topic, cData); err != nil {
 		var tl *ErrTooLarge
 		if errors.As(err, &tl) {
 			http.Error(w, err.Error(), http.StatusRequestEntityTooLarge)
@@ -602,8 +621,11 @@ func (s *Service) handlePublish(w http.ResponseWriter, r *http.Request, topic st
 		http.Error(w, "publish error: "+err.Error(), http.StatusServiceUnavailable)
 		return
 	}
+
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{"topic": topic, "data": body.Data})
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Cache-Control", "no-store")
+	_ = json.NewEncoder(w).Encode(map[string]any{"topic": topic, "data": json.RawMessage(cData)})
 }
 
 // handleSubscribe processes GET requests for SSE subscriptions
@@ -653,7 +675,8 @@ func (s *Service) handleSubscribe(w http.ResponseWriter, r *http.Request, topic 
 	stream, cancel := s.br.Subscribe(topic, s.cfg.ClientChanBuf)
 	defer cancel()
 
-	// Initial comments: listening + optional Last-Event-ID echo (UX only; no replay)
+	// Initial comments: client retry hint + listening + optional Last-Event-ID echo
+	s.sendSSEMessage(out, "retry: 5000\n\n", flusher, zw, bw)
 	lastID := r.Header.Get("Last-Event-ID")
 	if lastID != "" {
 		s.sendSSEMessage(out, ": last-event-id="+lastID+"\n\n", flusher, zw, bw)
@@ -812,6 +835,7 @@ func (s *Service) handleHealthz() http.HandlerFunc {
 			"num_goroutine": runtime.NumGoroutine(),
 		}
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
 		_ = json.NewEncoder(w).Encode(resp)
 	}
 }
@@ -1165,6 +1189,7 @@ func (b *broker) cleanupIdleTopics(idleTopics []string) {
 				hub.ringMu.Lock()
 				for i := 0; i < hub.cap; i++ {
 					if hub.ring[i] != nil {
+						hub.memoryUsage.Add(-int64(cap(hub.ring[i])))
 						byteSliceBuf.Put(hub.ring[i])
 						hub.ring[i] = nil
 					}
@@ -1196,6 +1221,7 @@ func (b *broker) handleMemoryPressure(pressureTopics []*topicHub) {
 			newTail := (hub.tail + hub.size/2) & hub.mask
 			for i := hub.tail; i != newTail; i = (i + 1) & hub.mask {
 				if hub.ring[i] != nil {
+					hub.memoryUsage.Add(-int64(cap(hub.ring[i])))
 					byteSliceBuf.Put(hub.ring[i])
 					hub.ring[i] = nil
 				}
@@ -1286,12 +1312,11 @@ func (b *broker) startFanoutWorkers(topic string, hub *topicHub) {
 	}
 }
 
-// cleanupFanoutShard closes all subscribers in a fanout shard
+// cleanupFanoutShard removes all subscribers in a fanout shard without closing channels
 func (b *broker) cleanupFanoutShard(hub *topicHub, shard int) {
 	hub.subsMu[shard].Lock()
 	for ch := range hub.subs[shard] {
-		close(ch)
-		delete(hub.subs[shard], ch)
+		delete(hub.subs[shard], ch) // do not close data channels to avoid send-on-closed panic
 	}
 	hub.subsMu[shard].Unlock()
 }
@@ -1330,7 +1355,7 @@ func (b *broker) deliverToShard(topic string, hub *topicHub, shard int, payload 
 			hub.deliveredFrames.Add(1)
 			b.totals.addDelivered(hashTopic(topic), 1)
 		default:
-			// Subscriber is slow/full, drop them
+			// Subscriber is slow/full, drop them (do not close channel)
 			byteSliceBuf.Put(subscriberPayload)
 			b.dropSlowSubscriber(hub, shard, ch, topic)
 		}
@@ -1341,12 +1366,11 @@ func (b *broker) deliverToShard(topic string, hub *topicHub, shard int, payload 
 	byteSliceBuf.Put(payload)
 }
 
-// dropSlowSubscriber removes a slow/full subscriber
+// dropSlowSubscriber removes a slow/full subscriber without closing channel
 func (b *broker) dropSlowSubscriber(hub *topicHub, shard int, ch chan []byte, topic string) {
 	hub.subsMu[shard].Lock()
 	if _, ok := hub.subs[shard][ch]; ok {
-		close(ch)
-		delete(hub.subs[shard], ch)
+		delete(hub.subs[shard], ch) // no close to avoid races with sends
 		hub.droppedClients.Add(1)
 		b.totals.addDropped(hashTopic(topic), 1)
 	}
@@ -1407,10 +1431,7 @@ func (b *broker) Subscribe(topic string, clientBuf int) (<-chan []byte, func()) 
 
 	cancel := func() {
 		h.subsMu[sh].Lock()
-		if _, ok := h.subs[sh][ch]; ok {
-			close(ch)
-			delete(h.subs[sh], ch)
-		}
+		delete(h.subs[sh], ch) // do not close to avoid race with snapshot senders
 		h.subsMu[sh].Unlock()
 		h.lastActivity.Store(time.Now().Unix())
 	}
@@ -1423,6 +1444,7 @@ func (e *ErrTooLarge) Error() string {
 	return fmt.Sprintf("payload too large for NOTIFY (%d > %d)", e.Have, e.Max)
 }
 
+// Publish compacts JSON then delegates to publishCompact.
 func (b *broker) Publish(ctx context.Context, topic string, data json.RawMessage) error {
 	if b.draining.Load() {
 		return errors.New("server draining")
@@ -1431,6 +1453,14 @@ func (b *broker) Publish(ctx context.Context, topic string, data json.RawMessage
 	cData, err := compactJSON(data)
 	if err != nil {
 		return fmt.Errorf("invalid JSON data: %w", err)
+	}
+	return b.publishCompact(ctx, topic, cData)
+}
+
+// publishCompact publishes already-compacted JSON (internal helper).
+func (b *broker) publishCompact(ctx context.Context, topic string, cData []byte) error {
+	if b.draining.Load() {
+		return errors.New("server draining")
 	}
 	// Build {"topic":"..","data":<cData>}
 	jbuf := jsonBuf.Get()
