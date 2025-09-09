@@ -813,22 +813,33 @@ func (b *broker) notificationLoop(ctx context.Context) {
 	defer close(b.shutdownDone)
 
 	for {
-		// Check if we should shutdown
+		// Check if we should shutdown before each wait
+		if b.draining.Load() {
+			return
+		}
+		
 		select {
 		case <-b.shutdownCtx.Done():
 			return
 		default:
 		}
 
-		n, err := b.listenConn.WaitForNotification(ctx)
+		n, err := b.listenConn.WaitForNotification(b.shutdownCtx)
 		if err != nil {
 			if b.draining.Load() || errors.Is(err, context.Canceled) {
 				return
 			}
 			log.Printf("ssepg: listen error: %v (retrying in 1s)", err)
-			time.Sleep(time.Second)
+			
+			// Interruptible sleep
+			select {
+			case <-time.After(time.Second):
+			case <-b.shutdownCtx.Done():
+				return
+			}
 			continue
 		}
+		
 		b.lastNote.Store(time.Now().UnixNano())
 
 		// Use pooled message struct
@@ -851,12 +862,18 @@ func (b *broker) Shutdown(ctx context.Context) {
 	b.shutdownCancel()
 
 	// Wait for notification loop to finish with timeout
+	shutdownTimer := time.NewTimer(1 * time.Second)
+	defer shutdownTimer.Stop()
+	
 	select {
 	case <-b.shutdownDone:
 		// Notification loop finished gracefully
-	case <-time.After(2 * time.Second):
+	case <-shutdownTimer.C:
 		// Timeout waiting for notification loop
 		log.Printf("ssepg: timeout waiting for notification loop to stop")
+	case <-ctx.Done():
+		// Context cancelled
+		log.Printf("ssepg: shutdown context cancelled")
 	}
 
 	// Now it's safe to close connections
