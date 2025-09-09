@@ -1398,40 +1398,40 @@ func TestMemoryManagement(t *testing.T) {
 	t.Logf("✅ Memory management test passed: memory tracking and cleanup features working")
 }
 
-func TestHighScaleConfig(t *testing.T) {
-	// Test that HighScaleConfig provides appropriate values for high-scale deployments
-	cfg := ssepg.HighScaleConfig()
+func TestConfigManualOverride(t *testing.T) {
+	// Test that DefaultConfig can be manually overridden for specific needs
+	cfg := ssepg.DefaultConfig()
 	
-	// Verify high-scale optimizations
-	if cfg.NotifyShards < 32 {
-		t.Errorf("HighScaleConfig should have >= 32 NotifyShards for 100K+ clients, got %d", cfg.NotifyShards)
+	// Record original adaptive values
+	originalNotifyShards := cfg.NotifyShards
+	originalFanoutShards := cfg.FanoutShards
+	originalRingCapacity := cfg.RingCapacity
+	
+	// Manual overrides for extreme scale
+	cfg.NotifyShards = 128
+	cfg.FanoutShards = 256
+	cfg.RingCapacity = 32768
+	cfg.ClientChanBuf = 2048
+	cfg.MemoryPressureThreshold = 50 * 1024 * 1024 * 1024 // 50GB
+	
+	// Verify overrides took effect
+	if cfg.NotifyShards != 128 {
+		t.Errorf("Manual override failed: NotifyShards should be 128, got %d", cfg.NotifyShards)
 	}
 	
-	if cfg.FanoutShards < 16 {
-		t.Errorf("HighScaleConfig should have >= 16 FanoutShards for parallelism, got %d", cfg.FanoutShards)
+	if cfg.FanoutShards != 256 {
+		t.Errorf("Manual override failed: FanoutShards should be 256, got %d", cfg.FanoutShards)
 	}
 	
-	if cfg.ClientChanBuf < 256 {
-		t.Errorf("HighScaleConfig should have >= 256 ClientChanBuf to prevent drops, got %d", cfg.ClientChanBuf)
+	if cfg.RingCapacity != 32768 {
+		t.Errorf("Manual override failed: RingCapacity should be 32768, got %d", cfg.RingCapacity)
 	}
 	
-	if cfg.RingCapacity < 4096 {
-		t.Errorf("HighScaleConfig should have >= 4096 RingCapacity for traffic bursts, got %d", cfg.RingCapacity)
-	}
-	
-	if cfg.MemoryPressureThreshold < 1024*1024*1024 { // 1GB
-		t.Errorf("HighScaleConfig should have >= 1GB MemoryPressureThreshold, got %d", cfg.MemoryPressureThreshold)
-	}
-	
-	if cfg.AlterSystemMaxNotificationMB < 512 {
-		t.Errorf("HighScaleConfig should request >= 512MB PostgreSQL notification queue, got %d", cfg.AlterSystemMaxNotificationMB)
-	}
-	
-	// Test that it can be used to create a service
+	// Test that manually configured service works
 	cfg.DSN = getTestDSN(t)
 	svc, err := ssepg.New(context.Background(), cfg)
 	if err != nil {
-		t.Fatalf("Failed to create service with HighScaleConfig: %v", err)
+		t.Fatalf("Failed to create service with manual overrides: %v", err)
 	}
 	defer func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -1439,7 +1439,11 @@ func TestHighScaleConfig(t *testing.T) {
 		_ = svc.Close(ctx)
 	}()
 	
-	t.Logf("✅ High-scale config test passed: configuration optimized for 100K+ clients")
+	t.Logf("✅ Manual override test passed:")
+	t.Logf("   Original adaptive: NotifyShards=%d, FanoutShards=%d, RingCapacity=%d", 
+		originalNotifyShards, originalFanoutShards, originalRingCapacity)
+	t.Logf("   Manual overrides: NotifyShards=%d, FanoutShards=%d, RingCapacity=%d", 
+		cfg.NotifyShards, cfg.FanoutShards, cfg.RingCapacity)
 }
 
 func TestAdaptiveConfiguration(t *testing.T) {
@@ -1464,22 +1468,14 @@ func TestAdaptiveConfiguration(t *testing.T) {
 		t.Error("MemoryPressureThreshold should be > 0")
 	}
 	
-	// Test that static config still works for backward compatibility
-	staticCfg := ssepg.StaticConfig()
-	if staticCfg.NotifyShards != 8 {
-		t.Errorf("StaticConfig should have fixed NotifyShards=8, got %d", staticCfg.NotifyShards)
-	}
-	
-	if staticCfg.FanoutShards != 4 {
-		t.Errorf("StaticConfig should have fixed FanoutShards=4, got %d", staticCfg.FanoutShards)
-	}
-	
-	// Test that adaptive config scales with resources
+	// Test that adaptive config scales appropriately with system resources
 	if cpus >= 4 {
-		// On multi-core systems, adaptive should be higher than static
-		if cfg.FanoutShards <= staticCfg.FanoutShards {
-			t.Logf("Note: Adaptive config FanoutShards=%d not higher than static=%d (may be intentional for this system)", 
-				cfg.FanoutShards, staticCfg.FanoutShards)
+		// On multi-core systems, should have reasonable parallelism
+		if cfg.FanoutShards < 8 {
+			t.Errorf("Expected FanoutShards >= 8 on %d-core system, got %d", cpus, cfg.FanoutShards)
+		}
+		if cfg.NotifyShards < 8 {
+			t.Errorf("Expected NotifyShards >= 8 on %d-core system, got %d", cpus, cfg.NotifyShards)
 		}
 	}
 	

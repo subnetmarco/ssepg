@@ -24,17 +24,25 @@ func main() {
 		log.Fatalf("bad DATABASE_URL: %v", err)
 	}
 
-	// Use high-scale configuration optimized for 100K+ concurrent clients
-	cfg := ssepg.HighScaleConfig()
+	// Start with adaptive configuration, then apply high-scale overrides
+	cfg := ssepg.DefaultConfig()
 	cfg.DSN = dsn
 	cfg.HealthPort = ":9090" // Separate health port for security
+	
+	// Manual overrides for extreme scale (500K+ concurrent clients)
+	cfg.RingCapacity = 32768                             // 4x larger ring buffers
+	cfg.ClientChanBuf = 2048                             // 4x larger client buffers  
+	cfg.MemoryPressureThreshold = 50 * 1024 * 1024 * 1024 // 50GB threshold
+	cfg.GracefulDrain = 60 * time.Second                 // Longer drain time
+	cfg.QueuePollInterval = 5 * time.Second              // More aggressive monitoring
+	cfg.MemoryCleanupInterval = 1 * time.Minute          // More frequent cleanup
 
-	log.Println("🚀 Starting ssepg in HIGH-SCALE mode")
-	log.Printf("   📊 NotifyShards: %d (distributes PostgreSQL load)", cfg.NotifyShards)
-	log.Printf("   ⚡ FanoutShards: %d (parallelizes message delivery)", cfg.FanoutShards)
-	log.Printf("   💾 RingCapacity: %d (buffers traffic spikes)", cfg.RingCapacity)
-	log.Printf("   📡 ClientChanBuf: %d (prevents client drops)", cfg.ClientChanBuf)
-	log.Printf("   🧠 MemoryThreshold: %d MB (allows large memory usage)", cfg.MemoryPressureThreshold/(1024*1024))
+	log.Println("🚀 Starting ssepg in HIGH-SCALE mode (adaptive + manual overrides)")
+	log.Printf("   📊 NotifyShards: %d (auto-adapted to CPU cores)", cfg.NotifyShards)
+	log.Printf("   ⚡ FanoutShards: %d (auto-adapted to CPU cores)", cfg.FanoutShards)
+	log.Printf("   💾 RingCapacity: %d (manually set for extreme scale)", cfg.RingCapacity)
+	log.Printf("   📡 ClientChanBuf: %d (manually set for extreme scale)", cfg.ClientChanBuf)
+	log.Printf("   🧠 MemoryThreshold: %d GB (manually set for extreme scale)", cfg.MemoryPressureThreshold/(1024*1024*1024))
 	log.Printf("   🔧 PostgreSQL queue: %d MB (requires superuser)", cfg.AlterSystemMaxNotificationMB)
 	log.Println()
 

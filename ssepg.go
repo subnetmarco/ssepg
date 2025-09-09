@@ -258,50 +258,6 @@ func DefaultConfig() Config {
 	return calculateOptimalConfig()
 }
 
-// StaticConfig returns the original static configuration for backward compatibility
-func StaticConfig() Config {
-	return Config{
-		BasePath:                     "/topics",
-		Healthz:                      "/healthz",
-		KeepAlive:                    15 * time.Second,
-		SSEBufSize:                   32 << 10,
-		NotifyShards:                 8,
-		FanoutShards:                 4,
-		RingCapacity:                 1024,
-		ClientChanBuf:                64,
-		MaxNotifyBytes:               7900,
-		GracefulDrain:                10 * time.Second,
-		QueueWarnThreshold:           0.5,
-		QueuePollInterval:            30 * time.Second,
-		MemoryCleanupInterval:        5 * time.Minute,
-		TopicIdleTimeout:             10 * time.Minute,
-		MemoryPressureThreshold:      100 * 1024 * 1024, // 100MB
-		AlterSystemMaxNotificationMB: 0,
-	}
-}
-
-// HighScaleConfig returns a configuration optimized for hundreds of thousands of concurrent clients
-func HighScaleConfig() Config {
-	return Config{
-		BasePath:                     "/topics",
-		Healthz:                      "/healthz",
-		KeepAlive:                    30 * time.Second, // Longer to reduce overhead
-		SSEBufSize:                   64 << 10,         // 64KB buffer
-		NotifyShards:                 64,               // More shards for distribution
-		FanoutShards:                 32,               // More workers per topic
-		RingCapacity:                 8192,             // Larger ring buffer
-		ClientChanBuf:                512,              // Larger client buffers
-		MaxNotifyBytes:               7900,
-		GracefulDrain:                30 * time.Second, // Longer drain for many clients
-		QueueWarnThreshold:           0.3,              // Earlier warning
-		QueuePollInterval:            10 * time.Second, // More frequent monitoring
-		MemoryCleanupInterval:        2 * time.Minute, // More frequent cleanup
-		TopicIdleTimeout:             5 * time.Minute, // Faster cleanup
-		MemoryPressureThreshold:      10 * 1024 * 1024 * 1024, // 10GB
-		AlterSystemMaxNotificationMB: 1024,                     // 1GB notification queue
-	}
-}
-
 // ---------- Public Service API ----------
 
 type Service struct {
