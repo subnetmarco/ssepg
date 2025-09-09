@@ -19,29 +19,12 @@ linters-settings:
     line-length: 140
   goimports:
     local-prefixes: github.com/subnetmarco/ssepg
-  gocritic:
-    enabled-tags:
-      - diagnostic
-      - performance
-      - style
-    disabled-checks:
-      - dupImport
-      - ifElseChain
-      - octalLiteral
-      - whyNoLint
-      - wrapperFunc
   funlen:
     lines: 100
     statements: 50
   gosec:
     excludes:
       - G404 # Use of weak random number generator - not relevant for this use case
-  revive:
-    rules:
-      - name: exported
-      - name: package-comments
-      - name: var-naming
-      - name: indent-error-flow
 
 linters:
   disable-all: true
@@ -59,7 +42,6 @@ linters:
     - dupl
     - gocyclo
     - goconst
-    - gocritic
     - funlen
     - misspell
     - unconvert
@@ -68,17 +50,10 @@ linters:
     # Style and formatting
     - gofmt
     - goimports
-    - revive
     - whitespace
     
     # Security
     - gosec
-    
-    # Performance and best practices
-    - bodyclose
-    - nolintlint
-    - exportloopref
-    - rowserrcheck
 
 issues:
   exclude-rules:

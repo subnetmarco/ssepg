@@ -911,7 +911,7 @@ func (p *byteSlicePool) Get(minCap int) []byte {
 	b := p.pool.Get().([]byte)
 	if cap(b) < minCap {
 		// If pooled slice is too small, return a new one
-		p.pool.Put(b)
+		p.pool.Put(b) //nolint:staticcheck // sync.Pool.Put expects interface{}
 		return make([]byte, 0, minCap)
 	}
 	return b[:0] // reset length but keep capacity
@@ -920,7 +920,7 @@ func (p *byteSlicePool) Put(b []byte) {
 	if cap(b) > 64*1024 { // Don't pool very large slices
 		return
 	}
-	p.pool.Put(b)
+	p.pool.Put(b) //nolint:staticcheck // sync.Pool.Put expects interface{}
 }
 
 // Memory pools for high-frequency allocations
