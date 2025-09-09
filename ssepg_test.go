@@ -17,7 +17,7 @@ import (
 )
 
 // Test database URL - uses testcontainers or local postgres
-func getTestDSN(t *testing.T) string {
+func getTestDSN(_ *testing.T) string {
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {
 		dsn = "postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable"
@@ -76,12 +76,13 @@ func TestBasicPublishSubscribe(t *testing.T) {
 	// Channel to receive messages
 	messages := make(chan map[string]interface{}, 10)
 	go func() {
+		const messageEvent = "message"
 		scanner := NewSSEScanner(resp.Body)
 		for scanner.Scan() {
 			event := scanner.Event()
-			if event.Event == "message" && event.Data != "" {
+			if event.Event == messageEvent && event.Data != "" {
 				var data map[string]interface{}
-				if err := json.Unmarshal([]byte(event.Data), &data); err == nil {
+				if jsonErr := json.Unmarshal([]byte(event.Data), &data); jsonErr == nil {
 					messages <- data
 				}
 			}
@@ -456,12 +457,13 @@ func TestGzipCompression(t *testing.T) {
 // Helper functions
 
 func readSSEMessages(body io.Reader, messages chan<- map[string]interface{}) {
+	const messageEvent = "message"
 	scanner := NewSSEScanner(body)
 	for scanner.Scan() {
 		event := scanner.Event()
-		if event.Event == "message" && event.Data != "" {
+		if event.Event == messageEvent && event.Data != "" {
 			var data map[string]interface{}
-			if err := json.Unmarshal([]byte(event.Data), &data); err == nil {
+			if jsonErr := json.Unmarshal([]byte(event.Data), &data); jsonErr == nil {
 				messages <- data
 			}
 		}
