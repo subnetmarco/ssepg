@@ -45,7 +45,7 @@ func main() {
   defer svc.Close(context.Background())
 
   mux := http.NewServeMux()
-  svc.Attach(mux) // POST /topics/:id, GET /topics/:id/events, GET /healthz
+  svc.Attach(mux) // POST/GET /topics/:id/events, GET /healthz
 
   // Example programmatic publish (optional)
   _ = svc.Publish(context.Background(), "alpha", json.RawMessage(`{"msg":"hello"}`))
@@ -67,7 +67,7 @@ func main() {
 curl -N -H 'Accept-Encoding: gzip' http://localhost:8080/topics/alpha/events
 
 # Publish
-curl -X POST http://localhost:8080/topics/alpha \
+curl -X POST http://localhost:8080/topics/alpha/events \
   -H 'Content-Type: application/json' \
   -d '{"data":{"msg":"hello"}}'
 
@@ -77,7 +77,7 @@ curl -s http://localhost:8080/healthz | jq
 
 ## HTTP API
 
-### POST /topics/{id}
+### POST /topics/{id}/events
 
 Body: {"data": <json>} (≤ ~7.9KB after compaction)
 Returns: {"topic":"{id}","data":<json>}
@@ -96,7 +96,7 @@ JSON totals + per-topic metrics (subscribers, ring depth, delivered, dropped). P
 cfg := ssepg.DefaultConfig()
 cfg.DSN = "<postgres DSN>"
 
-cfg.BasePath = "/topics"       // POST /topics/:id, GET /topics/:id/events
+cfg.BasePath = "/topics"       // POST/GET /topics/:id/events
 cfg.Healthz  = "/healthz"      // health endpoint
 cfg.KeepAlive = 15*time.Second // SSE heartbeat
 cfg.SSEBufSize = 32<<10        // bufio writer size
@@ -132,9 +132,57 @@ cfg.AlterSystemMaxNotificationMB = 64
 ## Customizing Routes
 
 ```
-cfg.BasePath = "/bus"   // POST /bus/:id, GET /bus/:id/events
+cfg.BasePath = "/bus"   // POST/GET /bus/:id/events
 cfg.Healthz  = "/ready" // GET /ready
 ```
+
+## Development
+
+### Running Tests
+
+```bash
+# Run all tests (requires PostgreSQL)
+make test
+
+# Run tests in short mode (uses in-memory mocks)
+make test-short
+
+# Run with coverage
+make test-coverage
+
+# Run integration tests with testcontainers
+make test-integration
+```
+
+### Local Development
+
+```bash
+# Set up development environment
+make dev-setup
+
+# Run linting
+make lint
+
+# Format code
+make fmt
+
+# Run example locally (requires PostgreSQL)
+DATABASE_URL=postgres://postgres@localhost:5432/postgres?sslmode=disable make example
+
+# Or use Docker Compose for full setup
+docker-compose up
+```
+
+### CI/CD
+
+The project uses GitHub Actions for:
+- **Linting**: golangci-lint with comprehensive rules
+- **Testing**: Unit and integration tests with PostgreSQL
+- **Building**: Multi-platform builds (Linux, macOS, Windows)  
+- **Security**: gosec security scanning
+- **Dependencies**: go mod tidy verification
+
+All PRs must pass linting, testing, and building before merge.
 
 ## License
 

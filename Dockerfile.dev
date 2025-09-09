@@ -1,0 +1,25 @@
+FROM golang:1.23-alpine AS development
+
+# Install development tools
+RUN apk add --no-cache git make curl
+
+# Set working directory
+WORKDIR /app
+
+# Copy go mod files
+COPY go.mod go.sum ./
+
+# Download dependencies
+RUN go mod download
+
+# Copy source code
+COPY . .
+
+# Build the application
+RUN go build -o ssepg-example ./examples/minimal
+
+# Expose port
+EXPOSE 8080
+
+# Run the application
+CMD ["./ssepg-example"]

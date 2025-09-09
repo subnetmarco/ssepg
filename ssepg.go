@@ -48,7 +48,7 @@ type Config struct {
 	DSN string
 
 	// HTTP routes
-	// Base path for topics; POST {BasePath}/{id} and GET {BasePath}/{id}/events
+	// Base path for topics; POST/GET {BasePath}/{id}/events
 	BasePath   string        // default "/topics"
 	Healthz    string        // default "/healthz"
 	KeepAlive  time.Duration // default 15s (SSE heartbeat)
@@ -63,7 +63,7 @@ type Config struct {
 	GracefulDrain  time.Duration // default 10s
 
 	// Diagnostics
-	QueueWarnThreshold float64      // default 0.5 (warn at 50% usage)
+	QueueWarnThreshold float64       // default 0.5 (warn at 50% usage)
 	QueuePollInterval  time.Duration // default 30s
 	// Advanced (optional, requires superuser; 0 disables)
 	AlterSystemMaxNotificationMB int
@@ -71,18 +71,18 @@ type Config struct {
 
 func DefaultConfig() Config {
 	return Config{
-		BasePath:                 "/topics",
-		Healthz:                  "/healthz",
-		KeepAlive:                15 * time.Second,
-		SSEBufSize:               32 << 10,
-		NotifyShards:             8,
-		FanoutShards:             4,
-		RingCapacity:             1024,
-		ClientChanBuf:            64,
-		MaxNotifyBytes:           7900,
-		GracefulDrain:            10 * time.Second,
-		QueueWarnThreshold:       0.5,
-		QueuePollInterval:        30 * time.Second,
+		BasePath:                     "/topics",
+		Healthz:                      "/healthz",
+		KeepAlive:                    15 * time.Second,
+		SSEBufSize:                   32 << 10,
+		NotifyShards:                 8,
+		FanoutShards:                 4,
+		RingCapacity:                 1024,
+		ClientChanBuf:                64,
+		MaxNotifyBytes:               7900,
+		GracefulDrain:                10 * time.Second,
+		QueueWarnThreshold:           0.5,
+		QueuePollInterval:            30 * time.Second,
 		AlterSystemMaxNotificationMB: 0,
 	}
 }
@@ -145,9 +145,10 @@ func New(ctx context.Context, cfg Config) (*Service, error) {
 }
 
 // Attach registers three handlers on the provided mux:
-//   POST {BasePath}/{id}        publish a message: {"data":<json>}
-//   GET  {BasePath}/{id}/events SSE stream
-//   GET  {Healthz}              JSON with per-topic and totals
+//
+//	POST {BasePath}/{id}/events publish a message: {"data":<json>}
+//	GET  {BasePath}/{id}/events SSE stream
+//	GET  {Healthz}              JSON with per-topic and totals
 func (s *Service) Attach(mux *http.ServeMux) {
 	s.mux = mux
 	mux.HandleFunc(strings.TrimRight(s.cfg.BasePath, "/")+"/", s.handleTopic())
@@ -202,10 +203,10 @@ func (s *Service) handleTopic() http.HandlerFunc {
 		}
 
 		// Publish
-		if r.Method == http.MethodPost && len(parts) == 1 {
+		if r.Method == http.MethodPost && len(parts) == 2 && parts[1] == "events" {
 			r.Body = http.MaxBytesReader(w, r.Body, 256<<10) // 256KB
 			var body postBody
-			if err := json.NewDecoder(r.Body).Decode(&body); err != nil || len(body.Data) == 0 {
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil || len(body.Data) == 0 || string(body.Data) == "null" {
 				http.Error(w, "invalid JSON; expected {\"data\": ...}", http.StatusBadRequest)
 				return
 			}
@@ -313,51 +314,62 @@ func (s *Service) handleHealthz() http.HandlerFunc {
 			DroppedClients   int64 `json:"dropped_clients"`
 		}
 
-		s.br.mu.Lock()
-		topicList := make([]topicSnapshot, 0, len(s.br.topics))
+		// Collect from all topic shards
+		topicList := make([]topicSnapshot, 0)
 		var tot totalsResp
-		for name, h := range s.br.topics {
-			subs, pending := 0, 0
-			for i := 0; i < len(h.subs); i++ {
-				h.subsMu[i].RLock()
-				subs += len(h.subs[i])
-				for ch := range h.subs[i] {
-					pending += len(ch)
-				}
-				h.subsMu[i].RUnlock()
-			}
-			h.ringMu.Lock()
-			depth := h.size
-			h.ringMu.Unlock()
 
-			topicList = append(topicList, topicSnapshot{
-				Topic:            name,
-				Subscribers:      subs,
-				DispatchDepth:    depth,
-				PendingToClients: pending,
-				Published:        h.published.Load(),
-				Broadcast:        h.broadcast.Load(),
-				DeliveredFrames:  h.deliveredFrames.Load(),
-				DroppedClients:   h.droppedClients.Load(),
-			})
-			tot.Topics++
-			tot.Subscribers += subs
-			tot.DispatchDepth += depth
-			tot.PendingToClients += pending
+		for i := range s.br.topicShards {
+			shard := &s.br.topicShards[i]
+			shard.mu.RLock()
+			for name, h := range shard.topics {
+				subs, pending := 0, 0
+				for i := 0; i < len(h.subs); i++ {
+					h.subsMu[i].RLock()
+					subs += len(h.subs[i])
+					for ch := range h.subs[i] {
+						pending += len(ch)
+					}
+					h.subsMu[i].RUnlock()
+				}
+				h.ringMu.Lock()
+				depth := h.size
+				h.ringMu.Unlock()
+
+				topicList = append(topicList, topicSnapshot{
+					Topic:            name,
+					Subscribers:      subs,
+					DispatchDepth:    depth,
+					PendingToClients: pending,
+					Published:        h.published.Load(),
+					Broadcast:        h.broadcast.Load(),
+					DeliveredFrames:  h.deliveredFrames.Load(),
+					DroppedClients:   h.droppedClients.Load(),
+				})
+				tot.Topics++
+				tot.Subscribers += subs
+				tot.DispatchDepth += depth
+				tot.PendingToClients += pending
+			}
+			shard.mu.RUnlock()
 		}
-		s.br.mu.Unlock()
 
 		pub, bro, del, drp := s.br.totals.snapshot()
 		tot.Published, tot.Broadcast, tot.DeliveredFrames, tot.DroppedClients = pub, bro, del, drp
 
 		resp := map[string]any{
-			"status":               "ok",
-			"now":                  time.Now().Format(time.RFC3339Nano),
-			"last_notification_at": func() string { t := s.br.lastNotificationAt(); if t.IsZero() { return "" }; return t.Format(time.RFC3339Nano) }(),
-			"totals":               tot,
-			"topics":               topicList,
-			"go_version":           runtime.Version(),
-			"num_goroutine":        runtime.NumGoroutine(),
+			"status": "ok",
+			"now":    time.Now().Format(time.RFC3339Nano),
+			"last_notification_at": func() string {
+				t := s.br.lastNotificationAt()
+				if t.IsZero() {
+					return ""
+				}
+				return t.Format(time.RFC3339Nano)
+			}(),
+			"totals":        tot,
+			"topics":        topicList,
+			"go_version":    runtime.Version(),
+			"num_goroutine": runtime.NumGoroutine(),
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(resp)
@@ -415,26 +427,43 @@ type topicHub struct {
 	droppedClients  atomic.Int64
 }
 
-// enqueue payload; drop oldest if full; reuse slot buffer when possible
+// enqueue payload; drop oldest if full; aggressive buffer reuse
 func (h *topicHub) enqueue(p []byte) {
 	h.ringMu.Lock()
 	if h.size == h.cap { // drop-oldest
+		// Return dropped buffer to pool before overwriting
+		if dropped := h.ring[h.tail]; dropped != nil {
+			byteSliceBuf.Put(dropped)
+		}
 		h.tail = (h.tail + 1) & h.mask
 	}
+
+	// Try to reuse existing slot buffer
 	slot := h.ring[h.head]
-	if cap(slot) >= len(p) {
+	if slot != nil && cap(slot) >= len(p) {
+		// Reuse existing buffer with sufficient capacity
 		slot = slot[:len(p)]
 		copy(slot, p)
 		h.ring[h.head] = slot
 	} else {
-		h.ring[h.head] = p
+		// Get buffer from pool or allocate new one
+		if slot != nil {
+			byteSliceBuf.Put(slot) // Return old buffer to pool
+		}
+		newSlot := byteSliceBuf.Get(len(p))
+		newSlot = newSlot[:len(p)]
+		copy(newSlot, p)
+		h.ring[h.head] = newSlot
 	}
+
 	h.head = (h.head + 1) & h.mask
 	if h.size < h.cap {
 		h.size++
 	}
 	h.ringMu.Unlock()
-	select { // coalesce wake-ups
+
+	// Non-blocking notification (coalesce wake-ups)
+	select {
 	case h.notify <- struct{}{}:
 	default:
 	}
@@ -447,11 +476,20 @@ func (h *topicHub) dequeue() (p []byte, ok bool) {
 		return nil, false
 	}
 	p = h.ring[h.tail]
-	h.ring[h.tail] = h.ring[h.tail][:0] // keep capacity
+	// Clear slot but don't return to pool yet - it may be reused in enqueue
+	h.ring[h.tail] = nil
 	h.tail = (h.tail + 1) & h.mask
 	h.size--
 	h.ringMu.Unlock()
 	return p, true
+}
+
+// Sharded topic management to reduce lock contention
+const topicShards = 32 // Power of 2 for efficient modulo
+
+type topicShard struct {
+	mu     sync.RWMutex
+	topics map[string]*topicHub
 }
 
 type broker struct {
@@ -462,8 +500,8 @@ type broker struct {
 	shards     []string
 	notifyPref [][]byte // cached NOTIFY "ch", '
 
-	mu     sync.Mutex
-	topics map[string]*topicHub
+	// Sharded topic storage for reduced contention
+	topicShards [topicShards]topicShard
 
 	draining atomic.Bool
 	lastNote atomic.Int64
@@ -493,7 +531,8 @@ func newBroker(ctx context.Context, cfg Config) (*broker, error) {
 	for i := 0; i < cfg.NotifyShards; i++ {
 		ch := shardName(i)
 		if _, err := lc.Exec(ctx, fmt.Sprintf(`LISTEN "%s"`, ch)); err != nil {
-			lc.Close(ctx); nc.Close(ctx)
+			lc.Close(ctx)
+			nc.Close(ctx)
 			return nil, fmt.Errorf("LISTEN %s failed: %w", ch, err)
 		}
 		shards[i] = ch
@@ -505,7 +544,10 @@ func newBroker(ctx context.Context, cfg Config) (*broker, error) {
 		listenConn: lc,
 		shards:     shards,
 		notifyPref: prefix,
-		topics:     make(map[string]*topicHub),
+	}
+	// Initialize topic shards
+	for i := range b.topicShards {
+		b.topicShards[i].topics = make(map[string]*topicHub)
 	}
 	go b.notificationLoop(ctx)
 	go b.queueUsageMonitor(ctx)
@@ -540,10 +582,27 @@ func (b *broker) queueUsageMonitor(ctx context.Context) {
 	}
 }
 
+func (b *broker) getTopicShard(topic string) *topicShard {
+	h := hashTopic(topic)
+	return &b.topicShards[h%topicShards]
+}
+
 func (b *broker) hub(topic string) *topicHub {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if h, ok := b.topics[topic]; ok {
+	shard := b.getTopicShard(topic)
+
+	// Try read lock first for existing topics (common case)
+	shard.mu.RLock()
+	if h, ok := shard.topics[topic]; ok {
+		shard.mu.RUnlock()
+		return h
+	}
+	shard.mu.RUnlock()
+
+	// Need to create new topic, acquire write lock
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+	// Double-check after acquiring write lock
+	if h, ok := shard.topics[topic]; ok {
 		return h
 	}
 	h := &topicHub{
@@ -561,29 +620,41 @@ func (b *broker) hub(topic string) *topicHub {
 		h.subs[i] = make(map[chan []byte]struct{})
 		h.fanout[i] = make(chan []byte, 64)
 	}
-	b.topics[topic] = h
+	shard.topics[topic] = h
 
 	// fanout workers
 	for i := 0; i < b.cfg.FanoutShards; i++ {
 		idx := i
 		go func(tp string, hub *topicHub, shard int) {
+			// Reusable snapshot buffer to reduce allocations
+			var snapshotBuf []chan []byte
 			for {
 				select {
 				case <-hub.quit:
 					hub.subsMu[shard].Lock()
 					for ch := range hub.subs[shard] {
-						close(ch); delete(hub.subs[shard], ch)
+						close(ch)
+						delete(hub.subs[shard], ch)
 					}
 					hub.subsMu[shard].Unlock()
 					return
 				case payload := <-hub.fanout[shard]:
-					// snapshot then deliver
+					// snapshot then deliver - reuse slice to reduce allocations
 					hub.subsMu[shard].RLock()
-					if len(hub.subs[shard]) == 0 {
+					subCount := len(hub.subs[shard])
+					if subCount == 0 {
 						hub.subsMu[shard].RUnlock()
+						// Return payload buffer to pool when no subscribers
+						byteSliceBuf.Put(payload)
 						continue
 					}
-					snapshot := make([]chan []byte, 0, len(hub.subs[shard]))
+					// Reuse snapshot slice - allocate once per worker
+					var snapshot []chan []byte
+					if cap(snapshotBuf) >= subCount {
+						snapshot = snapshotBuf[:0]
+					} else {
+						snapshot = make([]chan []byte, 0, subCount)
+					}
 					for ch := range hub.subs[shard] {
 						snapshot = append(snapshot, ch)
 					}
@@ -596,13 +667,18 @@ func (b *broker) hub(topic string) *topicHub {
 						default:
 							hub.subsMu[shard].Lock()
 							if _, ok := hub.subs[shard][ch]; ok {
-								close(ch); delete(hub.subs[shard], ch)
+								close(ch)
+								delete(hub.subs[shard], ch)
 								hub.droppedClients.Add(1)
 								b.totals.addDropped(hashTopic(tp), 1)
 							}
 							hub.subsMu[shard].Unlock()
 						}
 					}
+					// Store snapshot buffer for reuse
+					snapshotBuf = snapshot
+					// Return payload buffer to pool after all deliveries
+					byteSliceBuf.Put(payload)
 				}
 			}
 		}(topic, h, idx)
@@ -643,7 +719,8 @@ func (b *broker) Subscribe(topic string, clientBuf int) (<-chan []byte, func()) 
 	cancel := func() {
 		h.subsMu[sh].Lock()
 		if _, ok := h.subs[sh][ch]; ok {
-			close(ch); delete(h.subs[sh], ch)
+			close(ch)
+			delete(h.subs[sh], ch)
 		}
 		h.subsMu[sh].Unlock()
 	}
@@ -668,8 +745,11 @@ func (b *broker) Publish(ctx context.Context, topic string, data json.RawMessage
 	jbuf.WriteString(`","data":`)
 	jbuf.Write(cData)
 	jbuf.WriteByte('}')
-	payload := make([]byte, jbuf.Len())
+	// Use pooled byte slice instead of make([]byte, ...)
+	payload := byteSliceBuf.Get(jbuf.Len())
+	payload = payload[:jbuf.Len()]
 	copy(payload, jbuf.Bytes())
+	defer byteSliceBuf.Put(payload)
 
 	if len(payload) > b.cfg.MaxNotifyBytes {
 		return fmt.Errorf("payload too large for NOTIFY (%d > %d)", len(payload), b.cfg.MaxNotifyBytes)
@@ -706,13 +786,16 @@ func (b *broker) notificationLoop(ctx context.Context) {
 		}
 		b.lastNote.Store(time.Now().UnixNano())
 
-		var m Message
-		if err := json.Unmarshal([]byte(n.Payload), &m); err != nil {
+		// Use pooled message struct
+		m := messageBuf.Get()
+		if err := json.Unmarshal([]byte(n.Payload), m); err != nil {
 			log.Printf("ssepg: bad payload: %v", err)
+			messageBuf.Put(m)
 			continue
 		}
 		// enqueue raw bytes directly (reused/copy-on-write inside the ring)
 		b.hub(m.Topic).enqueue(m.Data)
+		messageBuf.Put(m)
 	}
 }
 
@@ -726,27 +809,34 @@ func (b *broker) Shutdown(ctx context.Context) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	// close hubs
-	b.mu.Lock()
-	for t, h := range b.topics {
-		close(h.quit)
-		delete(b.topics, t)
+	// close hubs across all shards
+	for i := range b.topicShards {
+		shard := &b.topicShards[i]
+		shard.mu.Lock()
+		for t, h := range shard.topics {
+			close(h.quit)
+			delete(shard.topics, t)
+		}
+		shard.mu.Unlock()
 	}
-	b.mu.Unlock()
 	_ = b.listenConn.Close(ctx)
 	_ = b.notifyConn.Close(ctx)
 }
 
 func (b *broker) allRingsEmpty() bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	for _, h := range b.topics {
-		h.ringMu.Lock()
-		empty := h.size == 0
-		h.ringMu.Unlock()
-		if !empty {
-			return false
+	for i := range b.topicShards {
+		shard := &b.topicShards[i]
+		shard.mu.RLock()
+		for _, h := range shard.topics {
+			h.ringMu.Lock()
+			empty := h.size == 0
+			h.ringMu.Unlock()
+			if !empty {
+				shard.mu.RUnlock()
+				return false
+			}
 		}
+		shard.mu.RUnlock()
 	}
 	return true
 }
@@ -761,12 +851,47 @@ func (b *broker) lastNotificationAt() time.Time {
 
 // ---------- small helpers & pools ----------
 
-var jsonBuf = &bufferPool{pool: sync.Pool{New: func() any { return new(bytes.Buffer) }}}
-
+// Pool type definitions
 type bufferPool struct{ pool sync.Pool }
 
 func (p *bufferPool) Get() *bytes.Buffer  { return p.pool.Get().(*bytes.Buffer) }
 func (p *bufferPool) Put(b *bytes.Buffer) { b.Reset(); p.pool.Put(b) }
+
+type messagePool struct{ pool sync.Pool }
+
+func (p *messagePool) Get() *Message { return p.pool.Get().(*Message) }
+func (p *messagePool) Put(m *Message) {
+	*m = Message{} // zero out for reuse
+	p.pool.Put(m)
+}
+
+type byteSlicePool struct{ pool sync.Pool }
+
+func (p *byteSlicePool) Get(minCap int) []byte {
+	b := p.pool.Get().([]byte)
+	if cap(b) < minCap {
+		// If pooled slice is too small, return a new one
+		p.pool.Put(b)
+		return make([]byte, 0, minCap)
+	}
+	return b[:0] // reset length but keep capacity
+}
+func (p *byteSlicePool) Put(b []byte) {
+	if cap(b) > 64*1024 { // Don't pool very large slices
+		return
+	}
+	p.pool.Put(b)
+}
+
+// Memory pools for high-frequency allocations
+var (
+	jsonBuf      = &bufferPool{pool: sync.Pool{New: func() any { return new(bytes.Buffer) }}}
+	messageBuf   = &messagePool{pool: sync.Pool{New: func() any { return new(Message) }}}
+	byteSliceBuf = &byteSlicePool{pool: sync.Pool{New: func() any {
+		// Start with 1KB slices, will grow as needed
+		return make([]byte, 0, 1024)
+	}}}
+)
 
 func compactJSON(raw json.RawMessage) (json.RawMessage, error) {
 	buf := jsonBuf.Get()
@@ -820,4 +945,3 @@ func writeSSE(w io.Writer, event, id string, data []byte) error {
 	_, err := w.Write(buf.Bytes())
 	return err
 }
-
