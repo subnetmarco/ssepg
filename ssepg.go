@@ -289,7 +289,11 @@ func (s *Service) handleSubscribe(w http.ResponseWriter, r *http.Request, topic 
 				}
 				return
 			}
-			if err := writeSSE(out, "message", "", payload); err != nil {
+			// writeSSE and then return payload to pool (subscriber owns this copy)
+			err := writeSSE(out, "message", "", payload)
+			// Always return to pool, even on error
+			byteSliceBuf.Put(payload)
+			if err != nil {
 				return
 			}
 			s.flushSSE(flusher, zw, bw)
@@ -711,18 +715,24 @@ func (b *broker) deliverToShard(topic string, hub *topicHub, shard int, payload 
 	}
 	hub.subsMu[shard].RUnlock()
 
-	// Deliver to all subscribers
+	// Each subscriber gets their own copy to ensure complete isolation
 	for _, ch := range snapshot {
+		// Make a dedicated copy for this subscriber
+		subscriberPayload := make([]byte, len(payload))
+		copy(subscriberPayload, payload)
+
 		select {
-		case ch <- payload:
+		case ch <- subscriberPayload:
 			hub.deliveredFrames.Add(1)
 			b.totals.addDelivered(hashTopic(topic), 1)
 		default:
+			// Subscriber is slow/full, drop them
 			b.dropSlowSubscriber(hub, shard, ch, topic)
 		}
 	}
 
 	*snapshotBuf = snapshot
+	// Return the shard payload to pool
 	byteSliceBuf.Put(payload)
 }
 
@@ -753,9 +763,17 @@ func (b *broker) startDispatcher(topic string, hub *topicHub) {
 					}
 					h.broadcast.Add(1)
 					b.totals.addBroadcast(hashTopic(tp), 1)
+
+					// Send a copy to each fanout shard to avoid races
 					for i := 0; i < b.cfg.FanoutShards; i++ {
-						h.fanout[i] <- payload
+						shardPayload := byteSliceBuf.Get(len(payload))
+						shardPayload = shardPayload[:len(payload)]
+						copy(shardPayload, payload)
+						h.fanout[i] <- shardPayload
 					}
+
+					// Return original payload to pool
+					byteSliceBuf.Put(payload)
 				}
 			}
 		}
