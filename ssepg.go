@@ -1270,9 +1270,12 @@ func (b *broker) deliverToShard(topic string, hub *topicHub, shard int, payload 
 	hub.subsMu[shard].RUnlock()
 
 	// Ensure complete memory isolation - each subscriber gets independent copy
+	// Use memory pool for efficient allocation
+	payloadLen := len(payload)
 	for _, ch := range snapshot {
-		// Create a completely independent copy for each subscriber
-		subscriberPayload := make([]byte, len(payload))
+		// Create a completely independent copy for each subscriber using pool
+		subscriberPayload := byteSliceBuf.Get(payloadLen)
+		subscriberPayload = subscriberPayload[:payloadLen]
 		copy(subscriberPayload, payload)
 		
 		select {
@@ -1281,6 +1284,8 @@ func (b *broker) deliverToShard(topic string, hub *topicHub, shard int, payload 
 			b.totals.addDelivered(hashTopic(topic), 1)
 		default:
 			// Subscriber is slow/full, drop them
+			// Return unused payload to pool before dropping
+			byteSliceBuf.Put(subscriberPayload)
 			b.dropSlowSubscriber(hub, shard, ch, topic)
 		}
 	}
@@ -1302,34 +1307,6 @@ func (b *broker) dropSlowSubscriber(hub *topicHub, shard int, ch chan []byte, to
 	hub.subsMu[shard].Unlock()
 }
 
-// batchAllocatePayloads efficiently creates copies for multiple subscribers
-func (b *broker) batchAllocatePayloads(payload []byte, count int) [][]byte {
-	copies := make([][]byte, count)
-	payloadLen := len(payload)
-	
-	// Allocate one large buffer and slice it up (more cache-friendly)
-	if count > 1 && payloadLen < 4096 { // Only for reasonable payload sizes
-		totalSize := payloadLen * count
-		bigBuffer := byteSliceBuf.Get(totalSize)
-		bigBuffer = bigBuffer[:totalSize]
-		
-		for i := 0; i < count; i++ {
-			start := i * payloadLen
-			end := start + payloadLen
-			copies[i] = bigBuffer[start:end]
-			copy(copies[i], payload)
-		}
-	} else {
-		// Fall back to individual allocations for large payloads
-		for i := 0; i < count; i++ {
-			copies[i] = byteSliceBuf.Get(payloadLen)
-			copies[i] = copies[i][:payloadLen]
-			copy(copies[i], payload)
-		}
-	}
-	
-	return copies
-}
 
 // startDispatcher starts the ring buffer dispatcher for a topic hub
 func (b *broker) startDispatcher(topic string, hub *topicHub) {
@@ -1348,8 +1325,11 @@ func (b *broker) startDispatcher(topic string, hub *topicHub) {
 					b.totals.addBroadcast(hashTopic(tp), 1)
 
 					// Create individual copies for each fanout shard to eliminate races
+					// Use memory pool for efficient allocation
+					payloadLen := len(payload)
 					for i := 0; i < b.cfg.FanoutShards; i++ {
-						shardPayload := make([]byte, len(payload))
+						shardPayload := byteSliceBuf.Get(payloadLen)
+						shardPayload = shardPayload[:payloadLen]
 						copy(shardPayload, payload)
 						h.fanout[i] <- shardPayload
 					}
