@@ -12,6 +12,15 @@
 *.out
 coverage.html
 
+# Go profiling files
+*.prof
+*.pprof
+cpu.prof
+mem.prof
+block.prof
+mutex.prof
+trace.out
+
 # Dependency directories (remove the comment below to include it)
 # vendor/
 

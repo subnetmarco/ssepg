@@ -1324,7 +1324,7 @@ func (b *broker) startDispatcher(topic string, hub *topicHub) {
 					h.broadcast.Add(1)
 					b.totals.addBroadcast(hashTopic(tp), 1)
 
-					// Create individual copies for each fanout shard to eliminate races
+					// Create individual copies for each fanout shard to eliminate racest i
 					// Use memory pool for efficient allocation
 					payloadLen := len(payload)
 					for i := 0; i < b.cfg.FanoutShards; i++ {
