@@ -68,9 +68,12 @@ func main() {
 
 ## Publish / Subscribe
 
-```
-# Subscribe (SSE)
-curl -N -H 'Accept-Encoding: gzip' http://localhost:8080/topics/alpha/events
+```bash
+# Subscribe (SSE) - without gzip for readability
+curl -N http://localhost:8080/topics/alpha/events
+
+# Subscribe (SSE) - with gzip compression  
+curl -N -H 'Accept-Encoding: gzip' --output - http://localhost:8080/topics/alpha/events
 
 # Publish
 curl -X POST http://localhost:8080/topics/alpha/events \
