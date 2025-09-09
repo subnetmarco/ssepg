@@ -921,6 +921,11 @@ type broker struct {
 	shutdownCtx    context.Context
 	shutdownCancel context.CancelFunc
 	shutdownDone   chan struct{}
+	
+	// Instance-specific memory pools to avoid cross-instance races
+	jsonBuf      *bufferPool
+	messageBuf   *messagePool
+	byteSliceBuf *byteSlicePool
 }
 
 func shardName(i int) string { return fmt.Sprintf("topic_broadcast_%d", i) }
@@ -963,6 +968,10 @@ func newBroker(ctx context.Context, cfg Config) (*broker, error) {
 		shutdownCtx:    shutdownCtx,
 		shutdownCancel: shutdownCancel,
 		shutdownDone:   make(chan struct{}),
+		// Initialize instance-specific memory pools
+		jsonBuf:      &bufferPool{pool: sync.Pool{New: func() any { return new(bytes.Buffer) }}},
+		messageBuf:   &messagePool{pool: sync.Pool{New: func() any { return new(Message) }}},
+		byteSliceBuf: &byteSlicePool{pool: sync.Pool{New: func() any { return make([]byte, 0, 1024) }}},
 	}
 	// Initialize topic shards
 	for i := range b.topicShards {
@@ -1260,29 +1269,19 @@ func (b *broker) deliverToShard(topic string, hub *topicHub, shard int, payload 
 	}
 	hub.subsMu[shard].RUnlock()
 
-	// Memory optimization: batch allocate copies to reduce allocation overhead
-	if len(snapshot) == 1 {
-		// Single subscriber - can share the payload directly
+	// Ensure complete memory isolation - each subscriber gets independent copy
+	for _, ch := range snapshot {
+		// Create a completely independent copy for each subscriber
+		subscriberPayload := make([]byte, len(payload))
+		copy(subscriberPayload, payload)
+		
 		select {
-		case snapshot[0] <- payload:
+		case ch <- subscriberPayload:
 			hub.deliveredFrames.Add(1)
 			b.totals.addDelivered(hashTopic(topic), 1)
 		default:
-			b.dropSlowSubscriber(hub, shard, snapshot[0], topic)
-		}
-	} else {
-		// Multiple subscribers - batch allocate copies
-		copies := b.batchAllocatePayloads(payload, len(snapshot))
-		for i, ch := range snapshot {
-			select {
-			case ch <- copies[i]:
-				hub.deliveredFrames.Add(1)
-				b.totals.addDelivered(hashTopic(topic), 1)
-			default:
-				// Return unused copy to pool
-				byteSliceBuf.Put(copies[i])
-				b.dropSlowSubscriber(hub, shard, ch, topic)
-			}
+			// Subscriber is slow/full, drop them
+			b.dropSlowSubscriber(hub, shard, ch, topic)
 		}
 	}
 
@@ -1348,17 +1347,11 @@ func (b *broker) startDispatcher(topic string, hub *topicHub) {
 					h.broadcast.Add(1)
 					b.totals.addBroadcast(hashTopic(tp), 1)
 
-					// Create copies for each fanout shard sequentially to avoid races
-					copies := make([][]byte, b.cfg.FanoutShards)
+					// Create individual copies for each fanout shard to eliminate races
 					for i := 0; i < b.cfg.FanoutShards; i++ {
-						copies[i] = byteSliceBuf.Get(len(payload))
-						copies[i] = copies[i][:len(payload)]
-						copy(copies[i], payload)
-					}
-
-					// Send copies to fanout shards
-					for i := 0; i < b.cfg.FanoutShards; i++ {
-						h.fanout[i] <- copies[i]
+						shardPayload := make([]byte, len(payload))
+						copy(shardPayload, payload)
+						h.fanout[i] <- shardPayload
 					}
 
 					// Return original payload to pool
