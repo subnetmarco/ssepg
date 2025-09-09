@@ -72,4 +72,11 @@ func TestWithTestcontainers(t *testing.T) {
 	t.Run("TopicIsolation", TestTopicIsolation)
 	t.Run("HorizontalScaling", TestHorizontalScaling)
 	t.Run("HealthEndpoint", TestHealthEndpoint)
+	t.Run("SeparateHealthPort", TestSeparateHealthPort)
+	t.Run("HealthMetricsOnSeparatePort", TestHealthMetricsOnSeparatePort)
+	t.Run("TokenAuthentication", TestTokenAuthentication)
+	t.Run("PartialAuthentication", TestPartialAuthentication)
+	t.Run("TokenCrossValidation", TestTokenCrossValidation)
+	t.Run("MemoryManagement", TestMemoryManagement)
+	t.Run("HighScaleConfig", TestHighScaleConfig)
 }

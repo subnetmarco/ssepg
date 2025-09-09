@@ -60,6 +60,34 @@ example: ## Run the minimal example (requires DATABASE_URL)
 	fi
 	go run examples/minimal/main.go
 
+example-health: ## Run example with separate health port (requires DATABASE_URL)
+	@if [ -z "$(DATABASE_URL)" ]; then \
+		echo "Please set DATABASE_URL environment variable"; \
+		echo "Example: make example-health DATABASE_URL=postgres://postgres@localhost:5432/postgres?sslmode=disable"; \
+		exit 1; \
+	fi
+	go run examples/separate-health/main.go
+
+example-auth: ## Run example with token authentication (requires DATABASE_URL, PUBLISH_TOKEN, LISTEN_TOKEN)
+	@if [ -z "$(DATABASE_URL)" ]; then \
+		echo "Please set DATABASE_URL environment variable"; \
+		exit 1; \
+	fi
+	@if [ -z "$(PUBLISH_TOKEN)" ] || [ -z "$(LISTEN_TOKEN)" ]; then \
+		echo "Please set PUBLISH_TOKEN and LISTEN_TOKEN environment variables"; \
+		echo "Example: PUBLISH_TOKEN=pub123 LISTEN_TOKEN=sub456 make example-auth DATABASE_URL=..."; \
+		exit 1; \
+	fi
+	go run examples/with-auth/main.go
+
+example-scale: ## Run high-scale example optimized for 100K+ clients (requires DATABASE_URL)
+	@if [ -z "$(DATABASE_URL)" ]; then \
+		echo "Please set DATABASE_URL environment variable"; \
+		echo "Example: make example-scale DATABASE_URL=postgres://postgres@localhost:5432/postgres?sslmode=disable"; \
+		exit 1; \
+	fi
+	go run examples/high-scale/main.go
+
 postgres-up: ## Start PostgreSQL with Docker Compose
 	docker-compose up -d postgres
 
