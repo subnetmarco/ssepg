@@ -32,11 +32,8 @@ func setupTestService(t *testing.T) (*ssepg.Service, *http.ServeMux) {
 	cfg.KeepAlive = 1 * time.Second // Faster for tests
 	cfg.GracefulDrain = 500 * time.Millisecond // Shorter for tests
 	
-	// Create service with timeout to avoid hanging
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	
-	svc, err := ssepg.New(ctx, cfg)
+	// Create service with background context (don't timeout the service itself)
+	svc, err := ssepg.New(context.Background(), cfg)
 	if err != nil {
 		t.Fatalf("Failed to create service: %v", err)
 	}
@@ -878,11 +875,8 @@ func TestTokenAuthentication(t *testing.T) {
 	cfg.PublishToken = "pub-secret-123"
 	cfg.ListenToken = "listen-secret-456"
 	
-	// Create service with timeout to avoid hanging
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	
-	svc, err := ssepg.New(ctx, cfg)
+	// Create service with background context
+	svc, err := ssepg.New(context.Background(), cfg)
 	if err != nil {
 		t.Fatalf("Failed to create service: %v", err)
 	}

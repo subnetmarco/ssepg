@@ -997,7 +997,7 @@ func (b *broker) notificationLoop(ctx context.Context) {
 		default:
 		}
 
-		n, err := b.listenConn.WaitForNotification(ctx)
+		n, err := b.listenConn.WaitForNotification(b.shutdownCtx)
 		if err != nil {
 			if b.draining.Load() || errors.Is(err, context.Canceled) {
 				return
