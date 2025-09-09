@@ -45,6 +45,17 @@ type Message struct {
 	Data  json.RawMessage `json:"data"`
 }
 
+// Constants for common sizes and limits
+const (
+	DefaultSSEBufferSize    = 32 << 10 // 32KB
+	DefaultMaxNotifyBytes   = 7900     // Postgres payload limit ~8KB
+	DefaultTopicShards      = 32       // Power of 2 for efficient modulo
+	MinFanoutBufferSize     = 16       // Minimum fanout channel buffer
+	MaxPooledSliceSize      = 64 << 10 // 64KB - don't pool larger slices
+	DefaultPoolSliceSize    = 1024     // 1KB - initial pool slice capacity
+	MaxSSEBufferGrowth      = 1 << 20  // 1MB - cap SSE buffer growth
+)
+
 // ---------- Configuration ----------
 
 type Config struct {
@@ -210,8 +221,8 @@ func calculateOptimalConfig() Config {
 		BasePath:                "/topics",
 		Healthz:                 "/healthz",
 		KeepAlive:               15 * time.Second,
-		SSEBufSize:              32 << 10,
-		MaxNotifyBytes:          7900,
+		SSEBufSize:              DefaultSSEBufferSize,
+		MaxNotifyBytes:          DefaultMaxNotifyBytes,
 		GracefulDrain:           10 * time.Second,
 		QueueWarnThreshold:      0.5,
 		QueuePollInterval:       30 * time.Second,
@@ -295,7 +306,7 @@ func New(ctx context.Context, cfg Config) (*Service, error) {
 		cfg.KeepAlive = 15 * time.Second
 	}
 	if cfg.SSEBufSize <= 0 {
-		cfg.SSEBufSize = 32 << 10
+		cfg.SSEBufSize = DefaultSSEBufferSize
 	}
 	if cfg.NotifyShards <= 0 {
 		cfg.NotifyShards = 8
@@ -313,7 +324,7 @@ func New(ctx context.Context, cfg Config) (*Service, error) {
 		cfg.ClientChanBuf = 64
 	}
 	if cfg.MaxNotifyBytes <= 0 {
-		cfg.MaxNotifyBytes = 7900
+		cfg.MaxNotifyBytes = DefaultMaxNotifyBytes
 	}
 	if cfg.GracefulDrain <= 0 {
 		cfg.GracefulDrain = 10 * time.Second
@@ -509,7 +520,8 @@ func (s *Service) handleTopic() http.HandlerFunc {
 				// AuthZ hook (optional)
 				if s.cfg.Authorize != nil {
 					if err := s.cfg.Authorize(r, topic, "publish"); err != nil {
-						http.Error(w, err.Error(), http.StatusForbidden)
+						// Authorization failure is not an authn failure; use 403
+						http.Error(w, fmt.Sprintf("forbidden: %v", err), http.StatusForbidden)
 						return
 					}
 				}
@@ -521,7 +533,7 @@ func (s *Service) handleTopic() http.HandlerFunc {
 				}
 				if s.cfg.Authorize != nil {
 					if err := s.cfg.Authorize(r, topic, "subscribe"); err != nil {
-						http.Error(w, err.Error(), http.StatusForbidden)
+						http.Error(w, fmt.Sprintf("forbidden: %v", err), http.StatusForbidden)
 						return
 					}
 				}
@@ -930,7 +942,7 @@ func (h *topicHub) dequeue() (p []byte, ok bool) {
 }
 
 // Sharded topic management to reduce lock contention
-const topicShards = 32 // Power of 2 for efficient modulo
+const topicShards = DefaultTopicShards // Power of 2 for efficient modulo
 
 type topicShard struct {
 	mu     sync.RWMutex
@@ -997,10 +1009,12 @@ func newBroker(ctx context.Context, cfg Config) (*broker, error) {
 		shutdownCancel: shutdownCancel,
 		shutdownDone:   make(chan struct{}),
 	}
+
 	// Initialize topic shards
 	for i := range b.topicShards {
 		b.topicShards[i].topics = make(map[string]*topicHub)
 	}
+
 	// Use cancelable broker context so goroutines stop on Shutdown()
 	go b.notificationLoop(b.shutdownCtx)
 	go b.queueUsageMonitor(b.shutdownCtx)
@@ -1226,13 +1240,20 @@ func (b *broker) hub(topic string) *topicHub {
 	// Initialize memory tracking
 	h.lastActivity.Store(time.Now().Unix())
 	h.memoryUsage.Store(int64(b.cfg.RingCapacity * 8)) // Rough slice overhead estimate
+
 	// init shards
 	h.subsMu = make([]sync.RWMutex, b.cfg.FanoutShards)
 	h.subs = make([]map[chan []byte]struct{}, b.cfg.FanoutShards)
 	h.fanout = make([]chan []byte, b.cfg.FanoutShards)
+
+	// Use adaptive fanout buffer size based on client buffer size
+	fanoutBufSize := b.cfg.ClientChanBuf / 4
+	if fanoutBufSize < MinFanoutBufferSize {
+		fanoutBufSize = MinFanoutBufferSize
+	}
 	for i := 0; i < b.cfg.FanoutShards; i++ {
 		h.subs[i] = make(map[chan []byte]struct{})
-		h.fanout[i] = make(chan []byte, 64)
+		h.fanout[i] = make(chan []byte, fanoutBufSize)
 	}
 	shard.topics[topic] = h
 
@@ -1588,7 +1609,7 @@ func (p *byteSlicePool) Get(minCap int) []byte {
 	return b[:0] // reset length but keep capacity
 }
 func (p *byteSlicePool) Put(b []byte) {
-	if cap(b) > 64*1024 { // Don't pool very large slices
+	if cap(b) > MaxPooledSliceSize { // Don't pool very large slices
 		return
 	}
 	p.pool.Put(b) //nolint:staticcheck
@@ -1599,8 +1620,8 @@ var (
 	jsonBuf      = &bufferPool{pool: sync.Pool{New: func() any { return new(bytes.Buffer) }}}
 	messageBuf   = &messagePool{pool: sync.Pool{New: func() any { return new(Message) }}}
 	byteSliceBuf = &byteSlicePool{pool: sync.Pool{New: func() any {
-		// Start with 1KB slices, will grow as needed
-		return make([]byte, 0, 1024)
+		// Start with default slice capacity, will grow as needed
+		return make([]byte, 0, DefaultPoolSliceSize)
 	}}}
 )
 
@@ -1636,7 +1657,7 @@ func writeSSE(w io.Writer, event, id string, data []byte) error {
 
 	// Pre-grow to reduce allocations when payload is large
 	// Rough estimate: headers + data + newlines
-	if n := len(data) + 64; n < 1<<20 { // cap growth to avoid huge allocs
+	if n := len(data) + 64; n < MaxSSEBufferGrowth { // cap growth to avoid huge allocs
 		buf.Grow(n)
 	}
 
