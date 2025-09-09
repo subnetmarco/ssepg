@@ -30,7 +30,7 @@ security: ## Run security scan
 	gosec ./...
 
 fmt: ## Format code
-	go fmt ./...
+	gofmt -s -w .
 	goimports -w .
 
 vet: ## Run go vet

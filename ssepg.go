@@ -790,7 +790,7 @@ func (b *broker) Publish(ctx context.Context, topic string, data json.RawMessage
 
 func (b *broker) notificationLoop(ctx context.Context) {
 	defer close(b.shutdownDone)
-	
+
 	for {
 		// Check if we should shutdown
 		select {
@@ -798,7 +798,7 @@ func (b *broker) notificationLoop(ctx context.Context) {
 			return
 		default:
 		}
-		
+
 		n, err := b.listenConn.WaitForNotification(ctx)
 		if err != nil {
 			if b.draining.Load() || errors.Is(err, context.Canceled) {
@@ -825,10 +825,10 @@ func (b *broker) notificationLoop(ctx context.Context) {
 
 func (b *broker) Shutdown(ctx context.Context) {
 	b.draining.Store(true)
-	
+
 	// Signal notification loop to stop
 	b.shutdownCancel()
-	
+
 	// Wait for notification loop to finish with timeout
 	select {
 	case <-b.shutdownDone:
@@ -837,11 +837,11 @@ func (b *broker) Shutdown(ctx context.Context) {
 		// Timeout waiting for notification loop
 		log.Printf("ssepg: timeout waiting for notification loop to stop")
 	}
-	
+
 	// Now it's safe to close connections
 	_ = b.listenConn.Close(ctx)
 	_ = b.notifyConn.Close(ctx)
-	
+
 	// drain rings (bounded)
 	deadline := time.Now().Add(b.cfg.GracefulDrain)
 	for time.Now().Before(deadline) {
@@ -850,7 +850,7 @@ func (b *broker) Shutdown(ctx context.Context) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	
+
 	// close hubs across all shards
 	for i := range b.topicShards {
 		shard := &b.topicShards[i]
