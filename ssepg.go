@@ -51,8 +51,13 @@ type Config struct {
 	// Base path for topics; POST/GET {BasePath}/{id}/events
 	BasePath   string        // default "/topics"
 	Healthz    string        // default "/healthz"
+	HealthPort string        // optional separate port for health endpoint (e.g. ":9090")
 	KeepAlive  time.Duration // default 15s (SSE heartbeat)
 	SSEBufSize int           // default 32KB buffered writer
+
+	// Security (optional token-based authentication)
+	PublishToken string // optional: required for POST requests (Bearer token)
+	ListenToken  string // optional: required for GET SSE requests (Bearer token)
 
 	// Broker internals
 	NotifyShards   int           // default 8 (LISTEN/NOTIFY channels)
@@ -90,9 +95,11 @@ func DefaultConfig() Config {
 // ---------- Public Service API ----------
 
 type Service struct {
-	cfg Config
-	br  *broker
-	mux *http.ServeMux // used in Attach
+	cfg         Config
+	br          *broker
+	mux         *http.ServeMux // used in Attach
+	healthMux   *http.ServeMux // separate health endpoint mux
+	healthServer *http.Server   // separate health server (if HealthPort configured)
 }
 
 // New creates the service; it opens Postgres connections and starts the LISTEN loop.
@@ -141,18 +148,50 @@ func New(ctx context.Context, cfg Config) (*Service, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Service{cfg: cfg, br: br}, nil
+	
+	svc := &Service{cfg: cfg, br: br}
+	
+	// Log security configuration status
+	svc.logSecurityStatus()
+	
+	// Set up separate health server if HealthPort is configured
+	if cfg.HealthPort != "" {
+		svc.healthMux = http.NewServeMux()
+		svc.healthMux.HandleFunc(cfg.Healthz, svc.handleHealthz())
+		
+		svc.healthServer = &http.Server{
+			Addr:              cfg.HealthPort,
+			Handler:           svc.healthMux,
+			ReadHeaderTimeout: 5 * time.Second,
+			WriteTimeout:      10 * time.Second,
+			IdleTimeout:       30 * time.Second,
+		}
+		
+		// Start health server in background
+		go func() {
+			log.Printf("ssepg: health server starting on %s", cfg.HealthPort)
+			if err := svc.healthServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Printf("ssepg: health server error: %v", err)
+			}
+		}()
+	}
+	
+	return svc, nil
 }
 
-// Attach registers three handlers on the provided mux:
+// Attach registers handlers on the provided mux:
 //
 //	POST {BasePath}/{id}/events publish a message: {"data":<json>}
 //	GET  {BasePath}/{id}/events SSE stream
-//	GET  {Healthz}              JSON with per-topic and totals
+//	GET  {Healthz}              JSON with per-topic and totals (only if HealthPort not configured)
 func (s *Service) Attach(mux *http.ServeMux) {
 	s.mux = mux
 	mux.HandleFunc(strings.TrimRight(s.cfg.BasePath, "/")+"/", s.handleTopic())
-	mux.HandleFunc(s.cfg.Healthz, s.handleHealthz())
+	
+	// Only attach health endpoint if not running on separate port
+	if s.cfg.HealthPort == "" {
+		mux.HandleFunc(s.cfg.Healthz, s.handleHealthz())
+	}
 }
 
 // Publish allows programmatic publish (bypassing HTTP).
@@ -164,8 +203,64 @@ func (s *Service) Publish(ctx context.Context, topic string, data json.RawMessag
 	return s.br.Publish(ctx, topic, data)
 }
 
+// logSecurityStatus logs the current security configuration
+func (s *Service) logSecurityStatus() {
+	var securityFeatures []string
+	var warnings []string
+	
+	// Check authentication status
+	publishAuth := s.cfg.PublishToken != ""
+	listenAuth := s.cfg.ListenToken != ""
+	
+	if publishAuth && listenAuth {
+		securityFeatures = append(securityFeatures, "✅ Full authentication enabled (publish + subscribe)")
+	} else if publishAuth {
+		securityFeatures = append(securityFeatures, "✅ Publish authentication enabled")
+		warnings = append(warnings, "⚠️  Subscribe endpoints are UNAUTHENTICATED")
+	} else if listenAuth {
+		securityFeatures = append(securityFeatures, "✅ Subscribe authentication enabled")
+		warnings = append(warnings, "⚠️  Publish endpoints are UNAUTHENTICATED")
+	} else {
+		warnings = append(warnings, "⚠️  NO AUTHENTICATION: All endpoints are PUBLIC")
+	}
+	
+	// Check health port isolation
+	if s.cfg.HealthPort != "" {
+		securityFeatures = append(securityFeatures, "✅ Health metrics isolated on separate port")
+	} else {
+		warnings = append(warnings, "⚠️  Health metrics exposed on main port")
+	}
+	
+	// Log security status
+	if len(securityFeatures) > 0 {
+		for _, feature := range securityFeatures {
+			log.Printf("ssepg: %s", feature)
+		}
+	}
+	
+	if len(warnings) > 0 {
+		for _, warning := range warnings {
+			log.Printf("ssepg: %s", warning)
+		}
+	}
+	
+	// Summary log
+	if publishAuth || listenAuth || s.cfg.HealthPort != "" {
+		log.Printf("ssepg: security features active (%d enabled, %d warnings)", len(securityFeatures), len(warnings))
+	} else {
+		log.Printf("ssepg: ⚠️  SECURITY WARNING: No authentication or isolation configured")
+	}
+}
+
 // Close gracefully drains and shuts down the service.
 func (s *Service) Close(ctx context.Context) error {
+	// Shutdown health server if running separately
+	if s.healthServer != nil {
+		if err := s.healthServer.Shutdown(ctx); err != nil {
+			log.Printf("ssepg: error shutting down health server: %v", err)
+		}
+	}
+	
 	s.br.Shutdown(ctx)
 	return nil
 }
@@ -177,6 +272,33 @@ var topicRE = regexp.MustCompile(`^[a-z0-9_-]{1,128}$`)
 func normalizeTopic(s string) (string, bool) {
 	x := strings.ToLower(s)
 	return x, topicRE.MatchString(x)
+}
+
+// validateToken checks if the request has the required Bearer token
+func validateToken(r *http.Request, requiredToken string) bool {
+	if requiredToken == "" {
+		return true // No token required
+	}
+	
+	authHeader := r.Header.Get("Authorization")
+	if authHeader == "" {
+		return false
+	}
+	
+	// Check for Bearer token format
+	const bearerPrefix = "Bearer "
+	if !strings.HasPrefix(authHeader, bearerPrefix) {
+		return false
+	}
+	
+	token := strings.TrimPrefix(authHeader, bearerPrefix)
+	return token == requiredToken
+}
+
+// sendUnauthorized sends a 401 Unauthorized response
+func sendUnauthorized(w http.ResponseWriter, message string) {
+	w.Header().Set("WWW-Authenticate", "Bearer")
+	http.Error(w, message, http.StatusUnauthorized)
 }
 
 type postBody struct {
@@ -232,6 +354,12 @@ func (s *Service) parseTopicRequest(w http.ResponseWriter, r *http.Request, base
 
 // handlePublish processes POST requests to publish messages
 func (s *Service) handlePublish(w http.ResponseWriter, r *http.Request, topic string) {
+	// Check publish token if configured
+	if !validateToken(r, s.cfg.PublishToken) {
+		sendUnauthorized(w, "publish requires valid token")
+		return
+	}
+	
 	r.Body = http.MaxBytesReader(w, r.Body, 256<<10) // 256KB
 	var body postBody
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || len(body.Data) == 0 || string(body.Data) == "null" {
@@ -248,6 +376,12 @@ func (s *Service) handlePublish(w http.ResponseWriter, r *http.Request, topic st
 
 // handleSubscribe processes GET requests for SSE subscriptions
 func (s *Service) handleSubscribe(w http.ResponseWriter, r *http.Request, topic string) {
+	// Check listen token if configured
+	if !validateToken(r, s.cfg.ListenToken) {
+		sendUnauthorized(w, "subscribe requires valid token")
+		return
+	}
+	
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")

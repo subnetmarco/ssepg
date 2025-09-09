@@ -7,7 +7,7 @@
 Zero-persistence, topic-based **Server-Sent Events** (SSE) fanout using **Postgres LISTEN/NOTIFY**.  
 **Horizontally scalable** across multiple app instances behind a load balancer. No tables or storage required.
 
-**Created by AI and perfected under Marco's supervision**
+**ℹ️ Created by AI under Marco's supervision**
 
 - Per-topic dispatcher with a **ring buffer** (drop-oldest under burst)
 - Single **LISTEN** connection, **sharded NOTIFY** channels (`topic_broadcast_{0..N-1}`)
@@ -49,7 +49,7 @@ func main() {
   defer svc.Close(context.Background())
 
   mux := http.NewServeMux()
-  svc.Attach(mux) // POST/GET /topics/:id/events, GET /healthz
+  svc.Attach(mux) // POST/GET /topics/:id/events (health on separate port if configured)
 
   // Example programmatic publish (optional)
   _ = svc.Publish(context.Background(), "alpha", json.RawMessage(`{"msg":"hello"}`))
@@ -97,6 +97,8 @@ SSE stream. Heartbeat comment every 15s. Frames use event: message with data: li
 
 JSON totals + per-topic metrics (subscribers, ring depth, delivered, dropped). Per-instance.
 
+**Note**: When `cfg.HealthPort` is configured, this endpoint is only available on the separate health port, not on the main application server.
+
 ## Configuration
 
 ```
@@ -105,6 +107,9 @@ cfg.DSN = "<postgres DSN>"
 
 cfg.BasePath = "/topics"       // POST/GET /topics/:id/events
 cfg.Healthz  = "/healthz"      // health endpoint
+cfg.HealthPort = ":9090"       // optional: separate port for health (security)
+cfg.PublishToken = "secret123"  // optional: Bearer token for POST requests
+cfg.ListenToken = "secret456"   // optional: Bearer token for GET SSE requests
 cfg.KeepAlive = 15*time.Second // SSE heartbeat
 cfg.SSEBufSize = 32<<10        // bufio writer size
 
@@ -167,7 +172,141 @@ ssepg is designed for **horizontal scaling** across multiple instances:
 ```
 cfg.BasePath = "/bus"   // POST/GET /bus/:id/events
 cfg.Healthz  = "/ready" // GET /ready
+cfg.HealthPort = ":9090" // Separate health port for security
 ```
+
+## Security
+
+### Authentication with Bearer Tokens
+
+Protect your SSE endpoints with optional Bearer token authentication. Supports separate tokens for publish and subscribe operations:
+
+```go
+cfg := ssepg.DefaultConfig()
+cfg.DSN = "postgres://..."
+cfg.PublishToken = "publisher-secret-abc123"   // Required for POST /topics/:id/events
+cfg.ListenToken = "subscriber-secret-def456"   // Required for GET /topics/:id/events
+
+svc, _ := ssepg.New(context.Background(), cfg)
+```
+
+**Authentication Modes:**
+
+| Configuration | Publish | Subscribe | Use Case |
+|---------------|---------|-----------|----------|
+| Both tokens set | 🔒 Auth required | 🔒 Auth required | Full security |
+| Only `PublishToken` | 🔒 Auth required | ✅ Open | Public read, controlled write |
+| Only `ListenToken` | ✅ Open | 🔒 Auth required | Public write, controlled read |
+| No tokens | ✅ Open | ✅ Open | Development/internal use |
+
+**Security Benefits:**
+- **🔒 Principle of least privilege**: Separate permissions for different operations
+- **🛡️ Token isolation**: Leaked subscriber token cannot publish messages
+- **🎯 Fine-grained access**: Grant only necessary permissions per client
+- **✅ Zero-trust**: Every operation can require authentication
+- **🔄 Independent rotation**: Change publish/subscribe tokens separately
+
+### Separate Health Port
+
+For production deployments, you can isolate health/metrics endpoints on a separate port for enhanced security:
+
+```go
+cfg := ssepg.DefaultConfig()
+cfg.DSN = "postgres://..."
+cfg.HealthPort = ":9090" // Health metrics on separate port
+
+svc, _ := ssepg.New(context.Background(), cfg)
+
+// Main server (public-facing, no health endpoint)
+mux := http.NewServeMux()
+svc.Attach(mux) // Only topics endpoints: POST/GET /topics/:id/events
+http.ListenAndServe(":8080", mux)
+
+// Health server runs automatically on :9090 with full metrics
+// curl http://localhost:9090/healthz
+```
+
+**Architecture:**
+```
+Public Internet → Load Balancer → :8080 (SSE topics only)
+                                     ↓
+Internal Network → Monitoring   → :9090 (health/metrics only)
+```
+
+**Security Benefits:**
+- **🔒 Firewall isolation**: Block external access to metrics port
+- **📊 Internal monitoring**: Health checks only from internal networks  
+- **🛡️ Reduced attack surface**: Metrics not exposed to public internet
+- **✅ Compliance**: Meets security requirements for sensitive environments
+- **🚀 Zero-downtime health checks**: Monitor without affecting user traffic
+
+**Health Metrics Include:**
+- Per-topic statistics (subscribers, published, delivered, dropped)
+- Global totals and system information
+- Ring buffer depths and pending message counts
+- PostgreSQL notification timestamps
+- Go runtime metrics (version, goroutines)
+
+## Security: Token Authentication
+
+Protect your SSE endpoints with optional Bearer token authentication:
+
+```go
+cfg := ssepg.DefaultConfig()
+cfg.DSN = "postgres://..."
+cfg.PublishToken = "publisher-secret-abc123"   // Required for POST
+cfg.ListenToken = "subscriber-secret-def456"   // Required for GET
+
+svc, _ := ssepg.New(context.Background(), cfg)
+```
+
+**Separate Token Benefits:**
+- **🔒 Principle of least privilege**: Different permissions for publish/subscribe
+- **🛡️ Token isolation**: Leaked listen token can't be used for publishing
+- **🎯 Fine-grained control**: Grant only necessary permissions
+- **✅ Zero-trust security**: Every request requires valid authentication
+
+**Usage Examples:**
+
+```bash
+# Subscribe with authentication
+curl -N -H 'Authorization: Bearer subscriber-secret-def456' \
+  http://localhost:8080/topics/alpha/events
+
+# Publish with authentication  
+curl -X POST http://localhost:8080/topics/alpha/events \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer publisher-secret-abc123' \
+  -d '{"data":{"msg":"authenticated hello"}}'
+
+# Unauthorized requests return 401
+curl http://localhost:8080/topics/alpha/events
+# → 401 Unauthorized: subscribe requires valid token
+```
+
+**Startup Security Logging:**
+
+ssepg logs security status on startup to ensure awareness:
+
+```
+ssepg: ✅ Full authentication enabled (publish + subscribe)
+ssepg: ✅ Health metrics isolated on separate port
+ssepg: security features active (2 enabled, 0 warnings)
+```
+
+Or with warnings for partial security:
+```
+ssepg: ✅ Publish authentication enabled
+ssepg: ⚠️  Subscribe endpoints are UNAUTHENTICATED
+ssepg: ⚠️  Health metrics exposed on main port
+ssepg: security features active (1 enabled, 2 warnings)
+```
+
+**Token Management:**
+- **Environment variables**: Store tokens securely outside code
+- **Independent rotation**: Change publish/subscribe tokens separately
+- **Standard format**: Bearer token (`Authorization: Bearer <token>`)
+- **Proper responses**: 401 Unauthorized with WWW-Authenticate header
 
 ## Development
 

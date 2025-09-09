@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -614,6 +615,686 @@ func TestHorizontalScaling(t *testing.T) {
 	}
 
 	t.Logf("✅ Horizontal scaling test passed: both instances received all messages regardless of publish source")
+}
+
+func TestSeparateHealthPort(t *testing.T) {
+	// Test that health endpoint can be hosted on a separate port with full metrics
+	cfg := ssepg.DefaultConfig()
+	cfg.DSN = getTestDSN(t)
+	cfg.KeepAlive = 1 * time.Second
+	cfg.GracefulDrain = 1 * time.Second
+	
+	// Find an available port for health server
+	healthListener, err := net.Listen("tcp", ":0")
+	if err != nil {
+		t.Fatalf("Failed to find available port: %v", err)
+	}
+	healthPort := healthListener.Addr().String()
+	_ = healthListener.Close()
+	
+	cfg.HealthPort = healthPort
+	
+	svc, err := ssepg.New(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Failed to create service: %v", err)
+	}
+	
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = svc.Close(ctx)
+		time.Sleep(100 * time.Millisecond)
+	})
+
+	// Give health server time to start
+	time.Sleep(200 * time.Millisecond)
+
+	// Main application server (no health endpoint)
+	mux := http.NewServeMux()
+	svc.Attach(mux)
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	// Test 1: Health endpoint is NOT available on main server
+	resp, err := http.Get(server.URL + "/healthz")
+	if err != nil {
+		t.Fatalf("Failed to make health request: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("Expected health endpoint to return 404 on main server, got %d", resp.StatusCode)
+	}
+
+	// Test 2: Topics endpoint still works on main server
+	topicResp, err := http.Get(server.URL + "/topics/test/events")
+	if err != nil {
+		t.Fatalf("Failed to connect to topics endpoint: %v", err)
+	}
+	defer func() { _ = topicResp.Body.Close() }()
+
+	if topicResp.StatusCode != http.StatusOK {
+		t.Errorf("Expected topics endpoint to work on main server, got %d", topicResp.StatusCode)
+	}
+
+	if topicResp.Header.Get("Content-Type") != "text/event-stream" {
+		t.Errorf("Expected SSE content type, got %s", topicResp.Header.Get("Content-Type"))
+	}
+
+	// Test 3: Generate some activity to create metrics
+	testData := json.RawMessage(`{"test": "separate-health"}`)
+	_ = svc.Publish(context.Background(), "health-test", testData)
+
+	// Test 4: Health metrics ARE available on separate health port
+	healthURL := "http://" + healthPort + "/healthz"
+	healthResp, err := http.Get(healthURL)
+	if err != nil {
+		t.Fatalf("Failed to connect to health server: %v", err)
+	}
+	defer func() { _ = healthResp.Body.Close() }()
+
+	if healthResp.StatusCode != http.StatusOK {
+		t.Errorf("Expected health endpoint to work on health server, got %d", healthResp.StatusCode)
+	}
+
+	if healthResp.Header.Get("Content-Type") != "application/json" {
+		t.Errorf("Expected JSON content type on health endpoint, got %s", healthResp.Header.Get("Content-Type"))
+	}
+
+	// Test 5: Verify health response contains expected metrics
+	var healthData map[string]interface{}
+	if err := json.NewDecoder(healthResp.Body).Decode(&healthData); err != nil {
+		t.Fatalf("Failed to decode health response: %v", err)
+	}
+
+	// Verify required health fields
+	if healthData["status"] != "ok" {
+		t.Errorf("Expected status 'ok', got %v", healthData["status"])
+	}
+
+	if healthData["totals"] == nil {
+		t.Error("Missing totals in health response")
+	}
+
+	if healthData["topics"] == nil {
+		t.Error("Missing topics in health response")
+	}
+
+	if healthData["go_version"] == nil {
+		t.Error("Missing go_version in health response")
+	}
+
+	if healthData["num_goroutine"] == nil {
+		t.Error("Missing num_goroutine in health response")
+	}
+
+	// Verify totals structure
+	totals, ok := healthData["totals"].(map[string]interface{})
+	if !ok {
+		t.Error("Totals is not a map")
+	} else {
+		expectedFields := []string{"topics", "subscribers", "published", "broadcast", "delivered_frames", "dropped_clients"}
+		for _, field := range expectedFields {
+			if totals[field] == nil {
+				t.Errorf("Missing field '%s' in totals", field)
+			}
+		}
+	}
+
+	t.Logf("✅ Separate health port test passed: health metrics fully functional on port %s", healthPort)
+}
+
+func TestHealthMetricsOnSeparatePort(t *testing.T) {
+	// Test that health metrics are properly updated when using separate health port
+	cfg := ssepg.DefaultConfig()
+	cfg.DSN = getTestDSN(t)
+	cfg.KeepAlive = 1 * time.Second
+	cfg.GracefulDrain = 1 * time.Second
+	
+	// Find an available port for health server
+	healthListener, err := net.Listen("tcp", ":0")
+	if err != nil {
+		t.Fatalf("Failed to find available port: %v", err)
+	}
+	healthPort := healthListener.Addr().String()
+	_ = healthListener.Close()
+	
+	cfg.HealthPort = healthPort
+	
+	svc, err := ssepg.New(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Failed to create service: %v", err)
+	}
+	
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = svc.Close(ctx)
+		time.Sleep(100 * time.Millisecond)
+	})
+
+	// Give health server time to start
+	time.Sleep(200 * time.Millisecond)
+
+	// Main application server
+	mux := http.NewServeMux()
+	svc.Attach(mux)
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	topic := "metrics-test"
+
+	// Get baseline metrics
+	healthURL := "http://" + healthPort + "/healthz"
+	baselineResp, err := http.Get(healthURL)
+	if err != nil {
+		t.Fatalf("Failed to get baseline health: %v", err)
+	}
+	defer func() { _ = baselineResp.Body.Close() }()
+
+	var baseline map[string]interface{}
+	if err := json.NewDecoder(baselineResp.Body).Decode(&baseline); err != nil {
+		t.Fatalf("Failed to decode baseline health: %v", err)
+	}
+
+	baselineTotals := baseline["totals"].(map[string]interface{})
+	baselinePublished := int64(baselineTotals["published"].(float64))
+
+	// Subscribe to create subscriber metrics
+	sseResp, err := http.Get(server.URL + "/topics/" + topic + "/events")
+	if err != nil {
+		t.Fatalf("Failed to subscribe: %v", err)
+	}
+	defer func() { _ = sseResp.Body.Close() }()
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Publish a message to update metrics
+	testData := map[string]interface{}{"metric_test": true, "timestamp": time.Now().Unix()}
+	payload, _ := json.Marshal(map[string]interface{}{"data": testData})
+	
+	publishResp, err := http.Post(server.URL+"/topics/"+topic+"/events", "application/json", bytes.NewBuffer(payload))
+	if err != nil {
+		t.Fatalf("Failed to publish: %v", err)
+	}
+	defer func() { _ = publishResp.Body.Close() }()
+
+	time.Sleep(200 * time.Millisecond)
+
+	// Get updated metrics
+	updatedResp, err := http.Get(healthURL)
+	if err != nil {
+		t.Fatalf("Failed to get updated health: %v", err)
+	}
+	defer func() { _ = updatedResp.Body.Close() }()
+
+	var updated map[string]interface{}
+	if err := json.NewDecoder(updatedResp.Body).Decode(&updated); err != nil {
+		t.Fatalf("Failed to decode updated health: %v", err)
+	}
+
+	// Verify metrics were updated
+	updatedTotals := updated["totals"].(map[string]interface{})
+	updatedPublished := int64(updatedTotals["published"].(float64))
+
+	if updatedPublished <= baselinePublished {
+		t.Errorf("Published count should have increased: baseline=%d, updated=%d", baselinePublished, updatedPublished)
+	}
+
+	// Check if topic appears in topics list
+	topics, ok := updated["topics"].([]interface{})
+	if !ok {
+		t.Error("Topics should be an array")
+	} else {
+		foundTopic := false
+		for _, topicData := range topics {
+			topicMap := topicData.(map[string]interface{})
+			if topicMap["topic"] == topic {
+				foundTopic = true
+				if int64(topicMap["published"].(float64)) == 0 {
+					t.Error("Topic should have non-zero published count")
+				}
+				break
+			}
+		}
+		if !foundTopic {
+			t.Errorf("Topic '%s' not found in health metrics", topic)
+		}
+	}
+
+	t.Logf("✅ Health metrics test passed: metrics properly updated on separate port %s", healthPort)
+}
+
+func TestTokenAuthentication(t *testing.T) {
+	// Test token-based authentication for publish and subscribe
+	cfg := ssepg.DefaultConfig()
+	cfg.DSN = getTestDSN(t)
+	cfg.KeepAlive = 1 * time.Second
+	cfg.GracefulDrain = 1 * time.Second
+	cfg.PublishToken = "pub-secret-123"
+	cfg.ListenToken = "listen-secret-456"
+	
+	svc, err := ssepg.New(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Failed to create service: %v", err)
+	}
+	
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = svc.Close(ctx)
+		time.Sleep(100 * time.Millisecond)
+	})
+
+	mux := http.NewServeMux()
+	svc.Attach(mux)
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	topic := "auth-test"
+	testData := map[string]interface{}{"authenticated": true}
+	payload, _ := json.Marshal(map[string]interface{}{"data": testData})
+
+	// Test 1: Publish without token should fail
+	resp, err := http.Post(server.URL+"/topics/"+topic+"/events", "application/json", bytes.NewBuffer(payload))
+	if err != nil {
+		t.Fatalf("Failed to make publish request: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("Expected 401 for publish without token, got %d", resp.StatusCode)
+	}
+
+	// Test 2: Publish with wrong token should fail
+	req, _ := http.NewRequest("POST", server.URL+"/topics/"+topic+"/events", bytes.NewBuffer(payload))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer wrong-token")
+	
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Failed to make publish request with wrong token: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("Expected 401 for publish with wrong token, got %d", resp.StatusCode)
+	}
+
+	// Test 3: Publish with correct token should succeed
+	req, _ = http.NewRequest("POST", server.URL+"/topics/"+topic+"/events", bytes.NewBuffer(payload))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer pub-secret-123")
+	
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Failed to make publish request with correct token: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Errorf("Expected 200 for publish with correct token, got %d: %s", resp.StatusCode, body)
+	}
+
+	// Test 4: Subscribe without token should fail
+	resp, err = http.Get(server.URL + "/topics/" + topic + "/events")
+	if err != nil {
+		t.Fatalf("Failed to make subscribe request: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("Expected 401 for subscribe without token, got %d", resp.StatusCode)
+	}
+
+	// Test 5: Subscribe with wrong token should fail
+	req, _ = http.NewRequest("GET", server.URL+"/topics/"+topic+"/events", nil)
+	req.Header.Set("Authorization", "Bearer wrong-listen-token")
+	
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Failed to make subscribe request with wrong token: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("Expected 401 for subscribe with wrong token, got %d", resp.StatusCode)
+	}
+
+	// Test 6: Subscribe with correct token should succeed
+	req, _ = http.NewRequest("GET", server.URL+"/topics/"+topic+"/events", nil)
+	req.Header.Set("Authorization", "Bearer listen-secret-456")
+	
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Failed to make subscribe request with correct token: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("Expected 200 for subscribe with correct token, got %d", resp.StatusCode)
+	}
+
+	if resp.Header.Get("Content-Type") != "text/event-stream" {
+		t.Errorf("Expected SSE content type, got %s", resp.Header.Get("Content-Type"))
+	}
+
+	// Test 7: Cross-token validation (publish token shouldn't work for subscribe)
+	req, _ = http.NewRequest("GET", server.URL+"/topics/"+topic+"/events", nil)
+	req.Header.Set("Authorization", "Bearer pub-secret-123") // Use publish token for subscribe
+	
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Failed to make subscribe request with publish token: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("Expected 401 when using publish token for subscribe, got %d", resp.StatusCode)
+	}
+
+	// Test 8: Cross-token validation (listen token shouldn't work for publish)
+	req, _ = http.NewRequest("POST", server.URL+"/topics/"+topic+"/events", bytes.NewBuffer(payload))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer listen-secret-456") // Use listen token for publish
+	
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Failed to make publish request with listen token: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("Expected 401 when using listen token for publish, got %d", resp.StatusCode)
+	}
+
+	t.Logf("✅ Token authentication test passed: separate tokens properly enforced")
+}
+
+func TestAuthenticatedPubSub(t *testing.T) {
+	// Test end-to-end authenticated publish/subscribe flow
+	cfg := ssepg.DefaultConfig()
+	cfg.DSN = getTestDSN(t)
+	cfg.KeepAlive = 1 * time.Second
+	cfg.GracefulDrain = 1 * time.Second
+	cfg.PublishToken = "publisher-key-789"
+	cfg.ListenToken = "subscriber-key-101"
+	
+	svc, err := ssepg.New(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Failed to create service: %v", err)
+	}
+	
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = svc.Close(ctx)
+		time.Sleep(100 * time.Millisecond)
+	})
+
+	mux := http.NewServeMux()
+	svc.Attach(mux)
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	topic := "auth-flow-test"
+
+	// Start authenticated SSE subscription
+	req, _ := http.NewRequest("GET", server.URL+"/topics/"+topic+"/events", nil)
+	req.Header.Set("Authorization", "Bearer subscriber-key-101")
+	
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Failed to connect to authenticated SSE: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("Authenticated SSE connection failed: %d", resp.StatusCode)
+	}
+
+	// Channel to receive messages
+	messages := make(chan map[string]interface{}, 10)
+	go func() {
+		const messageEvent = "message"
+		scanner := NewSSEScanner(resp.Body)
+		for scanner.Scan() {
+			event := scanner.Event()
+			if event.Event == messageEvent && event.Data != "" {
+				var data map[string]interface{}
+				if jsonErr := json.Unmarshal([]byte(event.Data), &data); jsonErr == nil {
+					messages <- data
+				}
+			}
+		}
+	}()
+
+	// Give SSE connection time to establish
+	time.Sleep(100 * time.Millisecond)
+
+	// Publish authenticated message
+	testData := map[string]interface{}{
+		"authenticated_message": true,
+		"timestamp": time.Now().Unix(),
+		"sender": "auth-test",
+	}
+	payload, _ := json.Marshal(map[string]interface{}{"data": testData})
+
+	pubReq, _ := http.NewRequest("POST", server.URL+"/topics/"+topic+"/events", bytes.NewBuffer(payload))
+	pubReq.Header.Set("Content-Type", "application/json")
+	pubReq.Header.Set("Authorization", "Bearer publisher-key-789")
+
+	pubResp, err := http.DefaultClient.Do(pubReq)
+	if err != nil {
+		t.Fatalf("Failed to publish authenticated message: %v", err)
+	}
+	defer func() { _ = pubResp.Body.Close() }()
+
+	if pubResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(pubResp.Body)
+		t.Fatalf("Authenticated publish failed with status %d: %s", pubResp.StatusCode, body)
+	}
+
+	// Wait for message delivery
+	select {
+	case receivedData := <-messages:
+		if receivedData["authenticated_message"] != true {
+			t.Errorf("Expected authenticated message, got %v", receivedData)
+		}
+		if receivedData["sender"] != "auth-test" {
+			t.Errorf("Expected sender 'auth-test', got %v", receivedData["sender"])
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Timeout waiting for authenticated message")
+	}
+
+	t.Logf("✅ Authenticated pub/sub flow test passed: secure end-to-end communication")
+}
+
+func TestPartialAuthentication(t *testing.T) {
+	// Test scenarios where only one token is configured
+	
+	t.Run("PublishOnlyAuth", func(t *testing.T) {
+		cfg := ssepg.DefaultConfig()
+		cfg.DSN = getTestDSN(t)
+		cfg.KeepAlive = 1 * time.Second
+		cfg.GracefulDrain = 1 * time.Second
+		cfg.PublishToken = "only-publish-token"
+		// cfg.ListenToken = "" // Not set - listen should be open
+		
+		svc, err := ssepg.New(context.Background(), cfg)
+		if err != nil {
+			t.Fatalf("Failed to create service: %v", err)
+		}
+		defer func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			_ = svc.Close(ctx)
+		}()
+
+		mux := http.NewServeMux()
+		svc.Attach(mux)
+		server := httptest.NewServer(mux)
+		defer server.Close()
+
+		topic := "publish-only-auth"
+		payload, _ := json.Marshal(map[string]interface{}{"data": map[string]string{"test": "publish-auth"}})
+
+		// Subscribe should work without token
+		resp, err := http.Get(server.URL + "/topics/" + topic + "/events")
+		if err != nil {
+			t.Fatalf("Failed to subscribe without token: %v", err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("Subscribe should work without token when only publish auth enabled, got %d", resp.StatusCode)
+		}
+
+		// Publish should require token
+		pubResp, err := http.Post(server.URL+"/topics/"+topic+"/events", "application/json", bytes.NewBuffer(payload))
+		if err != nil {
+			t.Fatalf("Failed to publish without token: %v", err)
+		}
+		defer func() { _ = pubResp.Body.Close() }()
+		if pubResp.StatusCode != http.StatusUnauthorized {
+			t.Errorf("Publish should require token, got %d", pubResp.StatusCode)
+		}
+	})
+
+	t.Run("ListenOnlyAuth", func(t *testing.T) {
+		cfg := ssepg.DefaultConfig()
+		cfg.DSN = getTestDSN(t)
+		cfg.KeepAlive = 1 * time.Second
+		cfg.GracefulDrain = 1 * time.Second
+		// cfg.PublishToken = "" // Not set - publish should be open
+		cfg.ListenToken = "only-listen-token"
+		
+		svc, err := ssepg.New(context.Background(), cfg)
+		if err != nil {
+			t.Fatalf("Failed to create service: %v", err)
+		}
+		defer func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			_ = svc.Close(ctx)
+		}()
+
+		mux := http.NewServeMux()
+		svc.Attach(mux)
+		server := httptest.NewServer(mux)
+		defer server.Close()
+
+		topic := "listen-only-auth"
+		payload, _ := json.Marshal(map[string]interface{}{"data": map[string]string{"test": "listen-auth"}})
+
+		// Publish should work without token
+		pubResp, err := http.Post(server.URL+"/topics/"+topic+"/events", "application/json", bytes.NewBuffer(payload))
+		if err != nil {
+			t.Fatalf("Failed to publish without token: %v", err)
+		}
+		defer func() { _ = pubResp.Body.Close() }()
+		if pubResp.StatusCode != http.StatusOK {
+			t.Errorf("Publish should work without token when only listen auth enabled, got %d", pubResp.StatusCode)
+		}
+
+		// Subscribe should require token
+		subResp, err := http.Get(server.URL + "/topics/" + topic + "/events")
+		if err != nil {
+			t.Fatalf("Failed to subscribe without token: %v", err)
+		}
+		defer func() { _ = subResp.Body.Close() }()
+		if subResp.StatusCode != http.StatusUnauthorized {
+			t.Errorf("Subscribe should require token, got %d", subResp.StatusCode)
+		}
+	})
+}
+
+func TestTokenCrossValidation(t *testing.T) {
+	// Explicitly test that tokens cannot be used for wrong operations
+	cfg := ssepg.DefaultConfig()
+	cfg.DSN = getTestDSN(t)
+	cfg.KeepAlive = 1 * time.Second
+	cfg.GracefulDrain = 1 * time.Second
+	cfg.PublishToken = "publish-only-secret"
+	cfg.ListenToken = "listen-only-secret"
+	
+	svc, err := ssepg.New(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Failed to create service: %v", err)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = svc.Close(ctx)
+	}()
+
+	mux := http.NewServeMux()
+	svc.Attach(mux)
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	topic := "cross-validation-test"
+	payload, _ := json.Marshal(map[string]interface{}{"data": map[string]string{"test": "cross-validation"}})
+
+	// Test 1: Try to publish with listen token (should fail)
+	req, _ := http.NewRequest("POST", server.URL+"/topics/"+topic+"/events", bytes.NewBuffer(payload))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer listen-only-secret")
+	
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Failed to make cross-validation publish request: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("Listen token should NOT work for publishing, got %d", resp.StatusCode)
+	}
+
+	// Test 2: Try to subscribe with publish token (should fail)
+	req, _ = http.NewRequest("GET", server.URL+"/topics/"+topic+"/events", nil)
+	req.Header.Set("Authorization", "Bearer publish-only-secret")
+	
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Failed to make cross-validation subscribe request: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("Publish token should NOT work for subscribing, got %d", resp.StatusCode)
+	}
+
+	// Test 3: Verify correct tokens work
+	req, _ = http.NewRequest("POST", server.URL+"/topics/"+topic+"/events", bytes.NewBuffer(payload))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer publish-only-secret")
+	
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Failed to publish with correct token: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("Correct publish token should work, got %d", resp.StatusCode)
+	}
+
+	req, _ = http.NewRequest("GET", server.URL+"/topics/"+topic+"/events", nil)
+	req.Header.Set("Authorization", "Bearer listen-only-secret")
+	
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Failed to subscribe with correct token: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("Correct listen token should work, got %d", resp.StatusCode)
+	}
+
+	t.Logf("✅ Token cross-validation test passed: tokens properly isolated")
 }
 
 // Helper functions
