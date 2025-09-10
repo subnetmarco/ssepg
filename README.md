@@ -138,9 +138,7 @@ ssepg: NotifyShards=16, FanoutShards=48, RingCapacity=8192, ClientChanBuf=512
 
 | Function | Behavior | Use Case |
 |----------|----------|----------|
-| `DefaultConfig()` | **Auto-adaptive** (recommended) | Production deployments |
-| `StaticConfig()` | Fixed values | Testing/development |
-| `HighScaleConfig()` | Max performance | 500K+ clients |
+| `DefaultConfig()` | **Auto-adaptive** | All deployments - automatically optimal |
 
 **Adaptive Scaling Tiers:**
 
@@ -161,18 +159,24 @@ cfg.MemoryPressureThreshold = 5 * 1024 * 1024 * 1024 // 5GB
 
 ## High-Scale Configuration
 
-For deployments handling **hundreds of thousands of concurrent clients**, use the optimized high-scale configuration:
+For deployments handling **hundreds of thousands of concurrent clients**, start with adaptive configuration and apply manual overrides:
 
 ```go
-cfg := ssepg.HighScaleConfig()
+// Start with adaptive configuration (automatically optimal for your hardware)
+cfg := ssepg.DefaultConfig()
 cfg.DSN = "postgres://..."
 
-// High-scale optimizations:
-// - 64 NotifyShards (vs 8 default)
-// - 32 FanoutShards per topic (vs 4 default)  
-// - 8192 RingCapacity (vs 1024 default)
-// - 512 ClientChanBuf (vs 64 default)
-// - 10GB MemoryPressureThreshold (vs 100MB default)
+// Manual overrides for extreme scale (500K+ concurrent clients)
+cfg.RingCapacity = 32768                             // 4x larger ring buffers
+cfg.ClientChanBuf = 2048                             // 4x larger client buffers  
+cfg.MemoryPressureThreshold = 50 * 1024 * 1024 * 1024 // 50GB threshold
+cfg.GracefulDrain = 60 * time.Second                 // Longer drain time
+cfg.QueuePollInterval = 5 * time.Second              // More aggressive monitoring
+
+// NotifyShards and FanoutShards are automatically set based on CPU count
+// but can also be manually overridden if needed:
+// cfg.NotifyShards = 128    // Force specific value
+// cfg.FanoutShards = 256    // Force specific value
 ```
 
 **Scaling Guidelines:**

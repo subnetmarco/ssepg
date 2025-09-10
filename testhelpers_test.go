@@ -78,5 +78,5 @@ func TestWithTestcontainers(t *testing.T) {
 	t.Run("PartialAuthentication", TestPartialAuthentication)
 	t.Run("TokenCrossValidation", TestTokenCrossValidation)
 	t.Run("MemoryManagement", TestMemoryManagement)
-	t.Run("HighScaleConfig", TestHighScaleConfig)
+	t.Run("ConfigManualOverride", TestConfigManualOverride)
 }

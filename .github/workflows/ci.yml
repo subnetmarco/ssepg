@@ -73,13 +73,6 @@ jobs:
       env:
         TEST_DATABASE_URL: postgres://testuser:testpass@localhost:5432/testdb?sslmode=disable
 
-    - name: Upload coverage to Codecov
-      uses: codecov/codecov-action@v4
-      with:
-        file: ./coverage.out
-        token: ${{ secrets.CODECOV_TOKEN }}
-        fail_ci_if_error: false
-
   build:
     name: Build
     runs-on: ubuntu-latest
