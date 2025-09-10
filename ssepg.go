@@ -43,10 +43,11 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-func init() {
-	// (4) Initialize random seed for jitter in backoff
-	rand.Seed(time.Now().UnixNano())
-}
+// Global random source for backoff jitter (Go 1.20+ compatible)
+var (
+	randMu     sync.Mutex
+	randSource = rand.New(rand.NewSource(time.Now().UnixNano()))
+)
 
 // Message is the wire format carried in LISTEN/NOTIFY.
 type Message struct {
@@ -1730,7 +1731,10 @@ func backoffWithJitter(attempt int) time.Duration {
 	if baseInt <= 0 {
 		baseInt = 1
 	}
-	jitter := time.Duration(rand.Int63n(baseInt))
+	// Thread-safe random access
+	randMu.Lock()
+	jitter := time.Duration(randSource.Int63n(baseInt))
+	randMu.Unlock()
 	return base/2 + jitter
 }
 
