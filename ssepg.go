@@ -46,7 +46,7 @@ import (
 // Global random source for backoff jitter (Go 1.20+ compatible)
 var (
 	randMu     sync.Mutex
-	randSource = rand.New(rand.NewSource(time.Now().UnixNano()))
+	randSource = rand.New(rand.NewSource(time.Now().UnixNano())) // #nosec G404 - backoff jitter doesn't need crypto/rand
 )
 
 // Message is the wire format carried in LISTEN/NOTIFY.
@@ -1720,7 +1720,7 @@ func backoffWithJitter(attempt int) time.Duration {
 		attempt = 6
 	}
 	// Safe conversion with bounds check
-	shift := uint(attempt)
+	shift := uint(attempt) // #nosec G115 - attempt is bounded to [0,6], safe conversion
 	if shift > 10 { // extra safety
 		shift = 10
 	}
