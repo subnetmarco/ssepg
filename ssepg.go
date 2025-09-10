@@ -25,6 +25,7 @@ import (
 	"hash/fnv"
 	"io"
 	"log"
+	"math/rand"
 	"net/http"
 	"os"
 	"os/exec"
@@ -345,7 +346,13 @@ func New(ctx context.Context, cfg Config) (*Service, error) {
 		cfg.MemoryPressureThreshold = 100 * 1024 * 1024 // 100MB
 	}
 
-	br, err := newBroker(ctx, cfg)
+	// (9) Connect with timeouts so startup cannot wedge
+	ctxListen, cancelListen := context.WithTimeout(ctx, 10*time.Second)
+	defer cancelListen()
+	ctxNotify, cancelNotify := context.WithTimeout(ctx, 10*time.Second)
+	defer cancelNotify()
+
+	br, err := newBroker(ctxListen, ctxNotify, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -496,9 +503,10 @@ func validateToken(r *http.Request, required string) bool {
 	return subtle.ConstantTimeCompare(tb, rb) == 1
 }
 
-// sendUnauthorized sends a 401 Unauthorized response
+// sendUnauthorized sends a 401 Unauthorized response (8: always vary by Authorization)
 func sendUnauthorized(w http.ResponseWriter, message string) {
 	w.Header().Set("WWW-Authenticate", "Bearer")
+	w.Header().Add("Vary", "Authorization")
 	http.Error(w, message, http.StatusUnauthorized)
 }
 
@@ -545,8 +553,12 @@ func (s *Service) handleTopic() http.HandlerFunc {
 					}
 				}
 				s.handleSubscribe(w, r, topic)
+			case http.MethodOptions:
+				// No CORS policy implemented by request, but respond OK for preflights if needed.
+				w.Header().Add("Vary", "Origin")
+				w.WriteHeader(http.StatusNoContent)
 			default:
-				w.Header().Set("Allow", "GET, POST")
+				w.Header().Set("Allow", "GET, POST, OPTIONS")
 				http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			}
 			return
@@ -628,6 +640,20 @@ func (s *Service) handlePublish(w http.ResponseWriter, r *http.Request, topic st
 	_ = json.NewEncoder(w).Encode(map[string]any{"topic": topic, "data": json.RawMessage(cData)})
 }
 
+// helper: set per-flush write deadline via ResponseController (Go 1.20+)
+// (5) Avoid pathological stalls on flush/write.
+func setWriteDeadline(w http.ResponseWriter, d time.Duration) {
+	type deadlineSetter interface {
+		SetWriteDeadline(t time.Time) error
+	}
+	// Try ResponseController first
+	if rc := http.NewResponseController(w); rc != nil {
+		_ = rc.SetWriteDeadline(time.Now().Add(d))
+		return
+	}
+	// If not available, noop (standard net/http doesn't expose Conn directly).
+}
+
 // handleSubscribe processes GET requests for SSE subscriptions
 func (s *Service) handleSubscribe(w http.ResponseWriter, r *http.Request, topic string) {
 	// Check listen token if configured
@@ -691,9 +717,12 @@ func (s *Service) handleSubscribe(w http.ResponseWriter, r *http.Request, topic 
 		case <-r.Context().Done():
 			return
 		case <-t.C:
+			// (5) apply per-flush write deadline
+			setWriteDeadline(w, 10*time.Second)
 			s.sendSSEMessage(out, ": keep-alive\n\n", flusher, zw, bw)
 		case payload, ok := <-stream:
 			if !ok {
+				setWriteDeadline(w, 5*time.Second)
 				s.sendSSEMessage(out, ": server shutting down\n\n", flusher, zw, bw)
 				return
 			}
@@ -704,6 +733,7 @@ func (s *Service) handleSubscribe(w http.ResponseWriter, r *http.Request, topic 
 				return
 			}
 			byteSliceBuf.Put(payload)
+			setWriteDeadline(w, 10*time.Second)
 			s.flushSSE(flusher, zw, bw)
 		}
 	}
@@ -896,6 +926,14 @@ type topicHub struct {
 	isMarkedIdle atomic.Bool  // Whether this hub is marked for cleanup
 }
 
+// (7) adjustMemoryUsage safely updates memoryUsage and clamps at 0.
+func (h *topicHub) adjustMemoryUsage(delta int64) {
+	v := h.memoryUsage.Add(delta)
+	if v < 0 {
+		h.memoryUsage.Store(0)
+	}
+}
+
 // enqueue payload; drop oldest if full; aggressive buffer reuse
 func (h *topicHub) enqueue(p []byte) {
 	// Update activity timestamp for cleanup detection
@@ -940,8 +978,8 @@ func (h *topicHub) enqueue(p []byte) {
 	}
 	h.ringMu.Unlock()
 
-	// Update memory usage estimate
-	h.memoryUsage.Add(memoryDelta)
+	// (7) Update memory usage estimate with clamp
+	h.adjustMemoryUsage(memoryDelta)
 
 	// Non-blocking notification (coalesce wake-ups)
 	select {
@@ -1000,23 +1038,24 @@ func hashTopic(topic string) uint32 {
 	return h.Sum32()
 }
 
-func newBroker(ctx context.Context, cfg Config) (*broker, error) {
-	lc, err := pgx.Connect(ctx, cfg.DSN)
+// (9) newBroker accepts distinct contexts (with timeout) for listen & notify connects.
+func newBroker(ctxListen, ctxNotify context.Context, cfg Config) (*broker, error) {
+	lc, err := pgx.Connect(ctxListen, cfg.DSN)
 	if err != nil {
 		return nil, err
 	}
-	nc, err := pgx.Connect(ctx, cfg.DSN)
+	nc, err := pgx.Connect(ctxNotify, cfg.DSN)
 	if err != nil {
-		_ = lc.Close(ctx)
+		_ = lc.Close(ctxListen)
 		return nil, err
 	}
 	shards := make([]string, cfg.NotifyShards)
 	prefix := make([][]byte, cfg.NotifyShards)
 	for i := 0; i < cfg.NotifyShards; i++ {
 		ch := shardName(i)
-		if _, err := lc.Exec(ctx, fmt.Sprintf(`LISTEN "%s"`, ch)); err != nil {
-			_ = lc.Close(ctx)
-			_ = nc.Close(ctx)
+		if _, err := lc.Exec(ctxListen, fmt.Sprintf(`LISTEN "%s"`, ch)); err != nil {
+			_ = lc.Close(ctxListen)
+			_ = nc.Close(ctxNotify)
 			return nil, fmt.Errorf("LISTEN %s failed: %w", ch, err)
 		}
 		shards[i] = ch
@@ -1045,11 +1084,11 @@ func newBroker(ctx context.Context, cfg Config) (*broker, error) {
 	go b.memoryCleanupMonitor(b.shutdownCtx)
 
 	if mb := cfg.AlterSystemMaxNotificationMB; mb > 0 {
-		_, err := nc.Exec(ctx, `ALTER SYSTEM SET max_notification_queue_size = '`+fmt.Sprint(mb)+`MB'`)
+		_, err := nc.Exec(ctxNotify, `ALTER SYSTEM SET max_notification_queue_size = '`+fmt.Sprint(mb)+`MB'`)
 		if err != nil {
 			log.Printf("ssepg: alter system failed (requires superuser): %v", err)
 		} else {
-			_, _ = nc.Exec(ctx, `SELECT pg_reload_conf()`)
+			_, _ = nc.Exec(ctxNotify, `SELECT pg_reload_conf()`)
 			log.Printf("ssepg: requested max_notification_queue_size=%dMB", mb)
 		}
 	}
@@ -1189,7 +1228,7 @@ func (b *broker) cleanupIdleTopics(idleTopics []string) {
 				hub.ringMu.Lock()
 				for i := 0; i < hub.cap; i++ {
 					if hub.ring[i] != nil {
-						hub.memoryUsage.Add(-int64(cap(hub.ring[i])))
+						hub.adjustMemoryUsage(-int64(cap(hub.ring[i])))
 						byteSliceBuf.Put(hub.ring[i])
 						hub.ring[i] = nil
 					}
@@ -1221,7 +1260,7 @@ func (b *broker) handleMemoryPressure(pressureTopics []*topicHub) {
 			newTail := (hub.tail + hub.size/2) & hub.mask
 			for i := hub.tail; i != newTail; i = (i + 1) & hub.mask {
 				if hub.ring[i] != nil {
-					hub.memoryUsage.Add(-int64(cap(hub.ring[i])))
+					hub.adjustMemoryUsage(-int64(cap(hub.ring[i])))
 					byteSliceBuf.Put(hub.ring[i])
 					hub.ring[i] = nil
 				}
@@ -1458,6 +1497,7 @@ func (b *broker) Publish(ctx context.Context, topic string, data json.RawMessage
 }
 
 // publishCompact publishes already-compacted JSON (internal helper).
+// Implements (2): timeout-wrap + minimal retries; (1): reconnect notify on failure.
 func (b *broker) publishCompact(ctx context.Context, topic string, cData []byte) error {
 	if b.draining.Load() {
 		return errors.New("server draining")
@@ -1494,13 +1534,107 @@ func (b *broker) publishCompact(ctx context.Context, topic string, cData []byte)
 	writeSQLEscaped(sqlBuf, payload)
 	sqlBuf.WriteByte('\'')
 
-	if _, err := b.notifyConn.Exec(ctx, sqlBuf.String()); err != nil {
-		return err
+	// (2) ensure a small timeout if caller didn't set one
+	ctxExec := ctx
+	if _, has := ctx.Deadline(); !has {
+		var cancel context.CancelFunc
+		ctxExec, cancel = context.WithTimeout(ctx, 3*time.Second)
+		defer cancel()
 	}
-	// counters
-	b.hub(topic).published.Add(1)
-	b.totals.addPublished(h, 1)
-	return nil
+
+	// Try up to 3 attempts with simple backoff & notify-conn reconnect on first error
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			time.Sleep(backoffWithJitter(attempt))
+		}
+		_, lastErr = b.notifyConn.Exec(ctxExec, sqlBuf.String())
+		if lastErr == nil {
+			// counters
+			b.hub(topic).published.Add(1)
+			b.totals.addPublished(h, 1)
+			return nil
+		}
+		if attempt == 0 {
+			// (1) try reconnect notify connection once we see a failure
+			if err := b.reconnectNotify(ctxExec); err != nil {
+				// keep lastErr as exec error; we still retry Exec after reconnect
+			}
+		}
+	}
+	return lastErr
+}
+
+// (1) reconnect logic with backoff for LISTEN and NOTIFY connections
+func (b *broker) reconnectListen(ctx context.Context) error {
+	// Reconnect listenConn and re-LISTEN all shards
+	var lc *pgx.Conn
+	var err error
+	for attempt := 0; attempt < 6; attempt++ {
+		c, cancel := context.WithTimeout(ctx, 8*time.Second)
+		lc, err = pgx.Connect(c, b.cfg.DSN)
+		cancel()
+		if err == nil {
+			ok := true
+			for _, ch := range b.shards {
+				if _, err2 := lc.Exec(ctx, fmt.Sprintf(`LISTEN "%s"`, ch)); err2 != nil {
+					ok = false
+					err = fmt.Errorf("LISTEN %s failed: %w", ch, err2)
+					break
+				}
+			}
+			if ok {
+				old := b.listenConn
+				b.listenConn = lc
+				if old != nil {
+					_ = old.Close(context.Background())
+				}
+				log.Printf("ssepg: reconnect listen ok")
+				return nil
+			}
+			_ = lc.Close(context.Background())
+		}
+		time.Sleep(backoffWithJitter(attempt))
+	}
+	return fmt.Errorf("reconnect listen failed: %w", err)
+}
+
+func (b *broker) reconnectNotify(ctx context.Context) error {
+	var nc *pgx.Conn
+	var err error
+	for attempt := 0; attempt < 6; attempt++ {
+		c, cancel := context.WithTimeout(ctx, 8*time.Second)
+		nc, err = pgx.Connect(c, b.cfg.DSN)
+		cancel()
+		if err == nil {
+			old := b.notifyConn
+			b.notifyConn = nc
+			if old != nil {
+				_ = old.Close(context.Background())
+			}
+			log.Printf("ssepg: reconnect notify ok")
+			return nil
+		}
+		time.Sleep(backoffWithJitter(attempt))
+	}
+	return fmt.Errorf("reconnect notify failed: %w", err)
+}
+
+// (1) backoff with jitter helper
+func backoffWithJitter(attempt int) time.Duration {
+	if attempt < 0 {
+		attempt = 0
+	}
+	base := time.Duration(200*(1<<uint(min(attempt, 6)))) * time.Millisecond // up to ~12.8s
+	jitter := time.Duration(rand.Int63n(int64(base / 2)))
+	return base/2 + jitter
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func (b *broker) notificationLoop(ctx context.Context) {
@@ -1519,8 +1653,9 @@ func (b *broker) notificationLoop(ctx context.Context) {
 			if b.draining.Load() || errors.Is(err, context.Canceled) {
 				return
 			}
-			log.Printf("ssepg: listen error: %v (retrying in 1s)", err)
-			time.Sleep(time.Second)
+			log.Printf("ssepg: listen error: %v (reconnecting)", err)
+			// (1) reconnect listen connection and continue
+			_ = b.reconnectListen(context.Background())
 			continue
 		}
 		b.lastNote.Store(time.Now().UnixNano())
