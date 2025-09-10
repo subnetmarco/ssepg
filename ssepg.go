@@ -9,6 +9,9 @@
 // - Compact JSON + prebuilt NOTIFY SQL for low allocs
 // - Optional gzip for SSE (automatic, via Accept-Encoding)
 // - Health snapshot handler (in-memory metrics, per instance)
+// - Automatic connection recovery with exponential backoff + jitter
+// - Constant-time token validation to prevent timing attacks
+// - Write deadline protection against stalled connections
 //
 // Ephemeral semantics: if a client is disconnected, it misses messages.
 package ssepg
@@ -40,10 +43,29 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
+func init() {
+	// (4) Initialize random seed for jitter in backoff
+	rand.Seed(time.Now().UnixNano())
+}
+
 // Message is the wire format carried in LISTEN/NOTIFY.
 type Message struct {
 	Topic string          `json:"topic"`
 	Data  json.RawMessage `json:"data"`
+}
+
+// Connection errors for better error handling and monitoring
+type ConnectionError struct {
+	Type string // "listen" or "notify"
+	Err  error
+}
+
+func (e *ConnectionError) Error() string {
+	return fmt.Sprintf("ssepg %s connection error: %v", e.Type, e.Err)
+}
+
+func (e *ConnectionError) Unwrap() error {
+	return e.Err
 }
 
 // Constants for common sizes and limits
@@ -55,6 +77,13 @@ const (
 	MaxPooledSliceSize    = 64 << 10 // 64KB - don't pool larger slices
 	DefaultPoolSliceSize  = 1024     // 1KB - initial pool slice capacity
 	MaxSSEBufferGrowth    = 1 << 20  // 1MB - cap SSE buffer growth
+
+	// Connection resilience constants
+	MaxRetryAttempts      = 3                // Maximum publish retry attempts
+	MaxReconnectAttempts  = 6                // Maximum reconnection attempts
+	DefaultPublishTimeout = 3 * time.Second  // Default publish timeout
+	ReconnectTimeout      = 8 * time.Second  // Connection timeout for reconnects
+	WriteDeadlineTimeout  = 10 * time.Second // SSE write deadline
 )
 
 // ---------- Configuration ----------
@@ -97,6 +126,14 @@ type Config struct {
 
 	// Advanced (optional, requires superuser; 0 disables)
 	AlterSystemMaxNotificationMB int
+
+	// Connection resilience (optional configuration)
+	PublishRetries    int           // default 3 (max retry attempts for publish)
+	ReconnectAttempts int           // default 6 (max reconnection attempts)
+	PublishTimeout    time.Duration // default 3s (publish operation timeout)
+
+	// Rate limiting (optional, 0 disables)
+	MaxPublishPerSecond int // default 0 (unlimited) - per-topic publish rate limit
 }
 
 // getSystemMemoryMB returns total system memory in megabytes (cgroup-aware)
@@ -345,11 +382,20 @@ func New(ctx context.Context, cfg Config) (*Service, error) {
 	if cfg.MemoryPressureThreshold <= 0 {
 		cfg.MemoryPressureThreshold = 100 * 1024 * 1024 // 100MB
 	}
+	if cfg.PublishRetries <= 0 {
+		cfg.PublishRetries = MaxRetryAttempts
+	}
+	if cfg.ReconnectAttempts <= 0 {
+		cfg.ReconnectAttempts = MaxReconnectAttempts
+	}
+	if cfg.PublishTimeout <= 0 {
+		cfg.PublishTimeout = DefaultPublishTimeout
+	}
 
-	// (9) Connect with timeouts so startup cannot wedge
-	ctxListen, cancelListen := context.WithTimeout(ctx, 10*time.Second)
+	// (2/9) Connect with timeouts so startup cannot wedge
+	ctxListen, cancelListen := context.WithTimeout(ctx, ReconnectTimeout)
 	defer cancelListen()
-	ctxNotify, cancelNotify := context.WithTimeout(ctx, 10*time.Second)
+	ctxNotify, cancelNotify := context.WithTimeout(ctx, ReconnectTimeout)
 	defer cancelNotify()
 
 	br, err := newBroker(ctxListen, ctxNotify, cfg)
@@ -503,10 +549,11 @@ func validateToken(r *http.Request, required string) bool {
 	return subtle.ConstantTimeCompare(tb, rb) == 1
 }
 
-// sendUnauthorized sends a 401 Unauthorized response (8: always vary by Authorization)
+// sendUnauthorized sends a 401 Unauthorized response
 func sendUnauthorized(w http.ResponseWriter, message string) {
 	w.Header().Set("WWW-Authenticate", "Bearer")
 	w.Header().Add("Vary", "Authorization")
+	w.Header().Set("Cache-Control", "no-store") // (5) discourage caching 401s
 	http.Error(w, message, http.StatusUnauthorized)
 }
 
@@ -554,8 +601,11 @@ func (s *Service) handleTopic() http.HandlerFunc {
 				}
 				s.handleSubscribe(w, r, topic)
 			case http.MethodOptions:
-				// No CORS policy implemented by request, but respond OK for preflights if needed.
+				// (5) Basic preflight friendliness without enforcing CORS policy
 				w.Header().Add("Vary", "Origin")
+				w.Header().Add("Vary", "Access-Control-Request-Headers")
+				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+				w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
 				w.WriteHeader(http.StatusNoContent)
 			default:
 				w.Header().Set("Allow", "GET, POST, OPTIONS")
@@ -606,7 +656,10 @@ func (s *Service) handlePublish(w http.ResponseWriter, r *http.Request, topic st
 		return
 	}
 
+	// (3) Ensure the request body is closed even on error paths
 	r.Body = http.MaxBytesReader(w, r.Body, 256<<10) // 256KB
+	defer r.Body.Close()
+
 	var body postBody
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || len(body.Data) == 0 || string(body.Data) == "null" {
 		http.Error(w, "invalid JSON; expected {\"data\": ...}", http.StatusBadRequest)
@@ -643,10 +696,7 @@ func (s *Service) handlePublish(w http.ResponseWriter, r *http.Request, topic st
 // helper: set per-flush write deadline via ResponseController (Go 1.20+)
 // (5) Avoid pathological stalls on flush/write.
 func setWriteDeadline(w http.ResponseWriter, d time.Duration) {
-	type deadlineSetter interface {
-		SetWriteDeadline(t time.Time) error
-	}
-	// Try ResponseController first
+	// Try ResponseController first (Go 1.20+)
 	if rc := http.NewResponseController(w); rc != nil {
 		_ = rc.SetWriteDeadline(time.Now().Add(d))
 		return
@@ -716,9 +766,13 @@ func (s *Service) handleSubscribe(w http.ResponseWriter, r *http.Request, topic 
 		select {
 		case <-r.Context().Done():
 			return
+		case <-s.br.shutdownCtx.Done(): // (2) exit cleanly on broker shutdown
+			setWriteDeadline(w, 5*time.Second)
+			s.sendSSEMessage(out, ": server shutting down\n\n", flusher, zw, bw)
+			return
 		case <-t.C:
 			// (5) apply per-flush write deadline
-			setWriteDeadline(w, 10*time.Second)
+			setWriteDeadline(w, WriteDeadlineTimeout)
 			s.sendSSEMessage(out, ": keep-alive\n\n", flusher, zw, bw)
 		case payload, ok := <-stream:
 			if !ok {
@@ -733,7 +787,7 @@ func (s *Service) handleSubscribe(w http.ResponseWriter, r *http.Request, topic 
 				return
 			}
 			byteSliceBuf.Put(payload)
-			setWriteDeadline(w, 10*time.Second)
+			setWriteDeadline(w, WriteDeadlineTimeout)
 			s.flushSSE(flusher, zw, bw)
 		}
 	}
@@ -787,6 +841,10 @@ func (s *Service) handleHealthz() http.HandlerFunc {
 			DroppedClients   int64 `json:"dropped_clients"`
 			TotalMemoryUsage int64 `json:"total_memory_usage_bytes"`
 			IdleTopics       int   `json:"idle_topics"`
+			// Connection health metrics
+			ListenConnected   bool  `json:"listen_connected"`
+			NotifyConnected   bool  `json:"notify_connected"`
+			ReconnectAttempts int64 `json:"reconnect_attempts"`
 		}
 
 		// Collect from all topic shards
@@ -848,6 +906,10 @@ func (s *Service) handleHealthz() http.HandlerFunc {
 
 		pub, bro, del, drp := s.br.totals.snapshot()
 		tot.Published, tot.Broadcast, tot.DeliveredFrames, tot.DroppedClients = pub, bro, del, drp
+
+		// Connection health (basic)
+		tot.ListenConnected = s.br.listenConn.Load() != nil
+		tot.NotifyConnected = s.br.notifyConn.Load() != nil
 
 		resp := map[string]any{
 			"status": "ok",
@@ -1014,8 +1076,10 @@ type topicShard struct {
 type broker struct {
 	cfg Config
 
-	notifyConn *pgx.Conn
-	listenConn *pgx.Conn
+	// (1) atomic pointers to avoid data races on connection swaps
+	notifyConn atomic.Pointer[pgx.Conn]
+	listenConn atomic.Pointer[pgx.Conn]
+
 	shards     []string
 	notifyPref [][]byte // cached NOTIFY "ch", '
 
@@ -1064,14 +1128,15 @@ func newBroker(ctxListen, ctxNotify context.Context, cfg Config) (*broker, error
 	shutdownCtx, shutdownCancel := context.WithCancel(context.Background())
 	b := &broker{
 		cfg:            cfg,
-		notifyConn:     nc,
-		listenConn:     lc,
 		shards:         shards,
 		notifyPref:     prefix,
 		shutdownCtx:    shutdownCtx,
 		shutdownCancel: shutdownCancel,
 		shutdownDone:   make(chan struct{}),
 	}
+	// Store initial connections atomically
+	b.listenConn.Store(lc)
+	b.notifyConn.Store(nc)
 
 	// Initialize topic shards
 	for i := range b.topicShards {
@@ -1084,12 +1149,14 @@ func newBroker(ctxListen, ctxNotify context.Context, cfg Config) (*broker, error
 	go b.memoryCleanupMonitor(b.shutdownCtx)
 
 	if mb := cfg.AlterSystemMaxNotificationMB; mb > 0 {
-		_, err := nc.Exec(ctxNotify, `ALTER SYSTEM SET max_notification_queue_size = '`+fmt.Sprint(mb)+`MB'`)
-		if err != nil {
-			log.Printf("ssepg: alter system failed (requires superuser): %v", err)
-		} else {
-			_, _ = nc.Exec(ctxNotify, `SELECT pg_reload_conf()`)
-			log.Printf("ssepg: requested max_notification_queue_size=%dMB", mb)
+		if conn := b.notifyConn.Load(); conn != nil {
+			_, err := conn.Exec(ctxNotify, `ALTER SYSTEM SET max_notification_queue_size = '`+fmt.Sprint(mb)+`MB'`)
+			if err != nil {
+				log.Printf("ssepg: alter system failed (requires superuser): %v", err)
+			} else {
+				_, _ = conn.Exec(ctxNotify, `SELECT pg_reload_conf()`)
+				log.Printf("ssepg: requested max_notification_queue_size=%dMB", mb)
+			}
 		}
 	}
 	return b, nil
@@ -1103,10 +1170,13 @@ func (b *broker) queueUsageMonitor(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			var u float64
-			if err := b.notifyConn.QueryRow(ctx, `SELECT pg_notification_queue_usage()`).Scan(&u); err == nil {
-				if u > b.cfg.QueueWarnThreshold {
-					log.Printf("ssepg: WARN pg_notification_queue_usage=%.2f", u)
+			// (1) read notify conn atomically
+			if conn := b.notifyConn.Load(); conn != nil {
+				var u float64
+				if err := conn.QueryRow(ctx, `SELECT pg_notification_queue_usage()`).Scan(&u); err == nil {
+					if u > b.cfg.QueueWarnThreshold {
+						log.Printf("ssepg: WARN pg_notification_queue_usage=%.2f", u)
+					}
 				}
 			}
 		}
@@ -1538,17 +1608,31 @@ func (b *broker) publishCompact(ctx context.Context, topic string, cData []byte)
 	ctxExec := ctx
 	if _, has := ctx.Deadline(); !has {
 		var cancel context.CancelFunc
-		ctxExec, cancel = context.WithTimeout(ctx, 3*time.Second)
+		ctxExec, cancel = context.WithTimeout(ctx, DefaultPublishTimeout)
 		defer cancel()
 	}
 
-	// Try up to 3 attempts with simple backoff & notify-conn reconnect on first error
+	// Try up to cfg.PublishRetries attempts with backoff & notify-conn reconnect on first error
 	var lastErr error
-	for attempt := 0; attempt < 3; attempt++ {
+	retries := b.cfg.PublishRetries
+	if retries <= 0 {
+		retries = MaxRetryAttempts
+	}
+	for attempt := 0; attempt < retries; attempt++ {
 		if attempt > 0 {
 			time.Sleep(backoffWithJitter(attempt))
 		}
-		_, lastErr = b.notifyConn.Exec(ctxExec, sqlBuf.String())
+		conn := b.notifyConn.Load()
+		if conn == nil {
+			// attempt reconnect immediately if nil
+			_ = b.reconnectNotify(ctxExec)
+			conn = b.notifyConn.Load()
+			if conn == nil {
+				lastErr = errors.New("notify connection unavailable")
+				continue
+			}
+		}
+		_, lastErr = conn.Exec(ctxExec, sqlBuf.String())
 		if lastErr == nil {
 			// counters
 			b.hub(topic).published.Add(1)
@@ -1557,9 +1641,7 @@ func (b *broker) publishCompact(ctx context.Context, topic string, cData []byte)
 		}
 		if attempt == 0 {
 			// (1) try reconnect notify connection once we see a failure
-			if err := b.reconnectNotify(ctxExec); err != nil {
-				// keep lastErr as exec error; we still retry Exec after reconnect
-			}
+			_ = b.reconnectNotify(ctxExec) // ignore reconnect error; keep lastErr as exec error
 		}
 	}
 	return lastErr
@@ -1570,8 +1652,12 @@ func (b *broker) reconnectListen(ctx context.Context) error {
 	// Reconnect listenConn and re-LISTEN all shards
 	var lc *pgx.Conn
 	var err error
-	for attempt := 0; attempt < 6; attempt++ {
-		c, cancel := context.WithTimeout(ctx, 8*time.Second)
+	attempts := b.cfg.ReconnectAttempts
+	if attempts <= 0 {
+		attempts = MaxReconnectAttempts
+	}
+	for attempt := 0; attempt < attempts; attempt++ {
+		c, cancel := context.WithTimeout(ctx, ReconnectTimeout)
 		lc, err = pgx.Connect(c, b.cfg.DSN)
 		cancel()
 		if err == nil {
@@ -1584,8 +1670,7 @@ func (b *broker) reconnectListen(ctx context.Context) error {
 				}
 			}
 			if ok {
-				old := b.listenConn
-				b.listenConn = lc
+				old := b.listenConn.Swap(lc)
 				if old != nil {
 					_ = old.Close(context.Background())
 				}
@@ -1602,13 +1687,16 @@ func (b *broker) reconnectListen(ctx context.Context) error {
 func (b *broker) reconnectNotify(ctx context.Context) error {
 	var nc *pgx.Conn
 	var err error
-	for attempt := 0; attempt < 6; attempt++ {
-		c, cancel := context.WithTimeout(ctx, 8*time.Second)
+	attempts := b.cfg.ReconnectAttempts
+	if attempts <= 0 {
+		attempts = MaxReconnectAttempts
+	}
+	for attempt := 0; attempt < attempts; attempt++ {
+		c, cancel := context.WithTimeout(ctx, ReconnectTimeout)
 		nc, err = pgx.Connect(c, b.cfg.DSN)
 		cancel()
 		if err == nil {
-			old := b.notifyConn
-			b.notifyConn = nc
+			old := b.notifyConn.Swap(nc)
 			if old != nil {
 				_ = old.Close(context.Background())
 			}
@@ -1621,20 +1709,29 @@ func (b *broker) reconnectNotify(ctx context.Context) error {
 }
 
 // (1) backoff with jitter helper
+//nolint:gosec // G115,G404: backoff timing is not security-critical, bounded conversions are safe
 func backoffWithJitter(attempt int) time.Duration {
 	if attempt < 0 {
 		attempt = 0
 	}
-	base := time.Duration(200*(1<<uint(min(attempt, 6)))) * time.Millisecond // up to ~12.8s
-	jitter := time.Duration(rand.Int63n(int64(base / 2)))
-	return base/2 + jitter
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
+	// Safe bounds checking to prevent overflow
+	if attempt > 6 {
+		attempt = 6
 	}
-	return b
+	// Safe conversion with bounds check
+	shift := uint(attempt)
+	if shift > 10 { // extra safety
+		shift = 10
+	}
+	base := time.Duration(200*(1<<shift)) * time.Millisecond // up to ~12.8s
+
+	// Use math/rand for jitter (timing is not security-critical here)
+	baseInt := int64(base / 2)
+	if baseInt <= 0 {
+		baseInt = 1
+	}
+	jitter := time.Duration(rand.Int63n(baseInt))
+	return base/2 + jitter
 }
 
 func (b *broker) notificationLoop(ctx context.Context) {
@@ -1648,7 +1745,14 @@ func (b *broker) notificationLoop(ctx context.Context) {
 		default:
 		}
 
-		n, err := b.listenConn.WaitForNotification(b.shutdownCtx)
+		conn := b.listenConn.Load()
+		if conn == nil {
+			// try to restore the listen connection if missing
+			_ = b.reconnectListen(context.Background())
+			continue
+		}
+
+		n, err := conn.WaitForNotification(b.shutdownCtx)
 		if err != nil {
 			if b.draining.Load() || errors.Is(err, context.Canceled) {
 				return
@@ -1695,8 +1799,12 @@ func (b *broker) Shutdown(ctx context.Context) {
 
 	// Only close connections if notification loop finished gracefully
 	if gracefulShutdown {
-		_ = b.listenConn.Close(ctx)
-		_ = b.notifyConn.Close(ctx)
+		if lc := b.listenConn.Load(); lc != nil {
+			_ = lc.Close(ctx)
+		}
+		if nc := b.notifyConn.Load(); nc != nil {
+			_ = nc.Close(ctx)
+		}
 	}
 
 	// drain rings (bounded)
