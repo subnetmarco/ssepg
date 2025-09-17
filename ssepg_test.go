@@ -1488,18 +1488,21 @@ func TestAdaptiveConfiguration(t *testing.T) {
 }
 
 func TestPostWithStreaming(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping POST streaming test in short mode (requires PostgreSQL)")
+	}
 	// Get test DSN
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {
 		dsn = "postgresql://postgres:postgres@127.0.0.1:5432/postgres?sslmode=disable"
 	}
 
-	cfg := DefaultConfig()
+	cfg := ssepg.DefaultConfig()
 	cfg.DSN = dsn
 	cfg.KeepAlive = 50 * time.Millisecond
 	cfg.GracefulDrain = 500 * time.Millisecond
 
-	svc, err := New(context.Background(), cfg)
+	svc, err := ssepg.New(context.Background(), cfg)
 	if err != nil {
 		t.Fatalf("Failed to create service: %v", err)
 	}
