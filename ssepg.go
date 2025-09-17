@@ -657,6 +657,10 @@ func (s *Service) handlePublish(w http.ResponseWriter, r *http.Request, topic st
 		return
 	}
 
+	// Check if client wants streaming response
+	acceptHeader := r.Header.Get("Accept")
+	wantsStream := strings.Contains(acceptHeader, "text/event-stream")
+
 	// (3) Ensure the request body is closed even on error paths
 	r.Body = http.MaxBytesReader(w, r.Body, 256<<10) // 256KB
 	defer r.Body.Close()
@@ -688,10 +692,90 @@ func (s *Service) handlePublish(w http.ResponseWriter, r *http.Request, topic st
 		return
 	}
 
+	// Handle streaming response if requested
+	if wantsStream {
+		s.handlePublishStream(w, r, topic)
+		return
+	}
+
+	// Default JSON response
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Cache-Control", "no-store")
 	_ = json.NewEncoder(w).Encode(map[string]any{"topic": topic, "data": json.RawMessage(cData)})
+}
+
+// handlePublishStream handles POST requests with streaming responses
+// When Accept: text/event-stream is specified, publishes then streams events
+func (s *Service) handlePublishStream(w http.ResponseWriter, r *http.Request, topic string) {
+	// SSE headers for streaming response
+	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache, no-transform")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no") // NGINX: disable buffering
+	w.Header().Add("Vary", "Accept-Encoding")
+	if s.cfg.PublishToken != "" {
+		w.Header().Add("Vary", "Authorization")
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+
+	bw := bufio.NewWriterSize(w, s.cfg.SSEBufSize)
+	var out io.Writer = bw
+	var zw *gzip.Writer
+	if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+		w.Header().Set("Content-Encoding", "gzip")
+		zw, _ = gzip.NewWriterLevel(bw, gzip.BestSpeed)
+		out = zw
+	}
+	defer func() {
+		if zw != nil {
+			_ = zw.Close()
+		}
+	}()
+
+	// Subscribe to receive events (including the one we just published)
+	stream, cancel := s.br.Subscribe(topic, s.cfg.ClientChanBuf)
+	defer cancel()
+
+	// Send initial SSE comments
+	s.sendSSEMessage(out, "retry: 5000\n\n", flusher, zw, bw)
+	s.sendSSEMessage(out, ": publish-and-subscribe "+topic+"\n\n", flusher, zw, bw)
+
+	t := time.NewTicker(s.cfg.KeepAlive)
+	defer t.Stop()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-s.br.shutdownCtx.Done():
+			setWriteDeadline(w, 5*time.Second)
+			s.sendSSEMessage(out, ": server shutting down\n\n", flusher, zw, bw)
+			return
+		case <-t.C:
+			setWriteDeadline(w, WriteDeadlineTimeout)
+			s.sendSSEMessage(out, ": keep-alive\n\n", flusher, zw, bw)
+		case payload, ok := <-stream:
+			if !ok {
+				setWriteDeadline(w, 5*time.Second)
+				s.sendSSEMessage(out, ": server shutting down\n\n", flusher, zw, bw)
+				return
+			}
+			if err := writeSSE(out, "message", "", payload); err != nil {
+				byteSliceBuf.Put(payload)
+				return
+			}
+			byteSliceBuf.Put(payload)
+			setWriteDeadline(w, WriteDeadlineTimeout)
+			s.flushSSE(flusher, zw, bw)
+		}
+	}
 }
 
 // helper: set per-flush write deadline via ResponseController (Go 1.20+)
