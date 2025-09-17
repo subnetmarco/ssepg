@@ -1,6 +1,7 @@
 package ssepg_test
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -1484,6 +1485,171 @@ func TestAdaptiveConfiguration(t *testing.T) {
 	t.Logf("✅ Adaptive configuration test passed: auto-configured for %d CPUs", cpus)
 	t.Logf("   📊 NotifyShards=%d, FanoutShards=%d, RingCapacity=%d, ClientChanBuf=%d",
 		cfg.NotifyShards, cfg.FanoutShards, cfg.RingCapacity, cfg.ClientChanBuf)
+}
+
+func TestPostWithStreaming(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping POST streaming test in short mode (requires PostgreSQL)")
+	}
+	// Get test DSN
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		dsn = "postgresql://postgres:postgres@127.0.0.1:5432/postgres?sslmode=disable"
+	}
+
+	cfg := ssepg.DefaultConfig()
+	cfg.DSN = dsn
+	cfg.KeepAlive = 50 * time.Millisecond
+	cfg.GracefulDrain = 500 * time.Millisecond
+
+	svc, err := ssepg.New(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Failed to create service: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	svc.Attach(mux)
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	topic := "stream-test"
+
+	t.Run("POST with JSON response (backward compatibility)", func(t *testing.T) {
+		payload := map[string]interface{}{
+			"data": map[string]string{"test": "normal"},
+		}
+		body, _ := json.Marshal(payload)
+
+		resp, err := http.Post(server.URL+"/topics/"+topic+"/events", "application/json", bytes.NewBuffer(body))
+		if err != nil {
+			t.Fatalf("POST request failed: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("Expected status 200, got %d", resp.StatusCode)
+		}
+
+		contentType := resp.Header.Get("Content-Type")
+		if !strings.Contains(contentType, "application/json") {
+			t.Errorf("Expected JSON content type, got %s", contentType)
+		}
+
+		var result map[string]interface{}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			t.Errorf("Failed to decode JSON response: %v", err)
+		}
+
+		if result["topic"] != topic {
+			t.Errorf("Expected topic %s, got %v", topic, result["topic"])
+		}
+	})
+
+	t.Run("POST with streaming response", func(t *testing.T) {
+		payload := map[string]interface{}{
+			"data": map[string]string{"test": "streaming"},
+		}
+		body, _ := json.Marshal(payload)
+
+		req, err := http.NewRequest("POST", server.URL+"/topics/"+topic+"/events", bytes.NewBuffer(body))
+		if err != nil {
+			t.Fatalf("Failed to create request: %v", err)
+		}
+
+		// Request streaming response
+		req.Header.Set("Accept", "text/event-stream")
+		req.Header.Set("Content-Type", "application/json")
+
+		client := &http.Client{
+			Timeout: 2 * time.Second,
+		}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("POST request failed: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("Expected status 200, got %d", resp.StatusCode)
+		}
+
+		contentType := resp.Header.Get("Content-Type")
+		if !strings.Contains(contentType, "text/event-stream") {
+			t.Errorf("Expected SSE content type, got %s", contentType)
+		}
+
+		// Since the POST publishes and then subscribes, we need to publish another event
+		// to verify the stream is working
+		go func() {
+			time.Sleep(200 * time.Millisecond)
+			secondPayload := map[string]interface{}{
+				"data": map[string]string{"test": "second-event"},
+			}
+			secondBody, _ := json.Marshal(secondPayload)
+			http.Post(server.URL+"/topics/"+topic+"/events", "application/json", bytes.NewBuffer(secondBody))
+		}()
+
+		// Read at least one event from the stream
+		scanner := bufio.NewScanner(resp.Body)
+		foundEvent := false
+		foundData := false
+		startTime := time.Now()
+
+		for scanner.Scan() {
+			line := scanner.Text()
+			if strings.HasPrefix(line, "data:") {
+				foundData = true
+				dataContent := strings.TrimSpace(line[5:])
+				var evt map[string]interface{}
+				if err := json.Unmarshal([]byte(dataContent), &evt); err == nil {
+					// Check if this is our test event (either "streaming" or "second-event")
+					if testVal, ok := evt["test"]; ok && (testVal == "streaming" || testVal == "second-event") {
+						foundEvent = true
+						break
+					}
+				}
+			}
+			// Stop after a reasonable time
+			if time.Since(startTime) > 1500*time.Millisecond {
+				break
+			}
+		}
+
+		if !foundData {
+			t.Error("No data received in stream")
+		}
+		if !foundEvent {
+			t.Error("Did not receive the published event in the stream")
+		}
+	})
+
+	t.Run("POST with mixed Accept header", func(t *testing.T) {
+		payload := map[string]interface{}{
+			"data": map[string]string{"test": "mixed"},
+		}
+		body, _ := json.Marshal(payload)
+
+		req, err := http.NewRequest("POST", server.URL+"/topics/"+topic+"/events", bytes.NewBuffer(body))
+		if err != nil {
+			t.Fatalf("Failed to create request: %v", err)
+		}
+
+		// Mixed accept header with SSE preference
+		req.Header.Set("Accept", "text/event-stream, application/json;q=0.9")
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("POST request failed: %v", err)
+		}
+		defer resp.Body.Close()
+
+		contentType := resp.Header.Get("Content-Type")
+		if !strings.Contains(contentType, "text/event-stream") {
+			t.Errorf("Expected SSE when text/event-stream is in Accept header, got %s", contentType)
+		}
+	})
 }
 
 // Helper functions
