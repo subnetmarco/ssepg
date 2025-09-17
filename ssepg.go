@@ -1794,6 +1794,7 @@ func (b *broker) reconnectNotify(ctx context.Context) error {
 }
 
 // (1) backoff with jitter helper
+//
 //nolint:gosec // G115,G404: backoff timing is not security-critical, bounded conversions are safe
 func backoffWithJitter(attempt int) time.Duration {
 	if attempt < 0 {
@@ -1805,7 +1806,7 @@ func backoffWithJitter(attempt int) time.Duration {
 	}
 	// Safe conversion with bounds check
 	shift := uint(attempt) // #nosec G115 - attempt is bounded to [0,6], safe conversion
-	if shift > 10 { // extra safety
+	if shift > 10 {        // extra safety
 		shift = 10
 	}
 	base := time.Duration(200*(1<<shift)) * time.Millisecond // up to ~12.8s
